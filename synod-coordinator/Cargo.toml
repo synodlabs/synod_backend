@@ -35,3 +35,4 @@ hex = "0.4.3"
 
 [dev-dependencies]
 rand = "0.8.5"
+tokio-tungstenite = "0.24"

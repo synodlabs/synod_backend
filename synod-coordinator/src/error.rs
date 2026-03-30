@@ -74,6 +74,9 @@ pub enum AppError {
     NotFound(String),
     #[error("Invalid Input: {0}")]
     InvalidInput(String),
+
+    #[error("Invalid API key")]
+    InvalidApiKey,
 }
 
 impl IntoResponse for AppError {
@@ -100,6 +103,7 @@ impl IntoResponse for AppError {
             AppError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "REDIS_ERROR"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             AppError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "INVALID_INPUT"),
+            AppError::InvalidApiKey => (StatusCode::UNAUTHORIZED, "INVALID_API_KEY"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
 

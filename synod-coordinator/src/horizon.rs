@@ -1,7 +1,6 @@
-use crate::error::{AppError, AppResult};
 use crate::AppState;
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn, error, debug};
@@ -219,6 +218,12 @@ impl HorizonWatcher {
                     asset = %asset_code,
                     "Inflow routed to pool"
                 );
+                let _ = self.state.tx_events.send(crate::TreasuryEvent::PoolBalanceUpdate {
+                    treasury_id: self.treasury_id,
+                    pool_key: pool_key.clone(),
+                    amount: amount.parse().unwrap_or(0.0),
+                    asset_code: asset_code.clone(),
+                });
             }
             InflowResult::UnroutedInflow => {
                 warn!(wallet = %self.wallet_address, "Unrouted inflow detected");

@@ -66,10 +66,13 @@ async fn main() -> anyhow::Result<()> {
     let redis_client = redis::Client::open(settings.redis.url.as_str())?;
     let redis_manager = ConnectionManager::new(redis_client).await?;
 
+    let (tx_events, _) = tokio::sync::broadcast::channel(100);
+
     let state = AppState {
         db: db_pool,
         redis: redis_manager,
         config: settings.clone(),
+        tx_events,
     };
 
     let app = synod_coordinator::router(state);

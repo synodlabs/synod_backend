@@ -5,6 +5,11 @@ use redis::aio::ConnectionManager;
 use tokio::net::TcpListener;
 
 pub async fn spawn_test_server() -> String {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+
     let settings = Settings {
         server: synod_coordinator::config::ServerConfig { 
             host: "127.0.0.1".to_string(),
@@ -55,10 +60,12 @@ pub async fn spawn_test_server() -> String {
 
     let redis_manager = ConnectionManager::new(redis_client).await.unwrap();
 
+    let (tx_events, _) = tokio::sync::broadcast::channel(100);
     let state = AppState {
         db: db_pool,
         redis: redis_manager,
         config: settings,
+        tx_events,
     };
 
     let app = synod_coordinator::router(state);

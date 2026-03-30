@@ -1,12 +1,12 @@
 use axum::extract::{Path, State};
 use axum::{routing::{get, post}, Json, Router};
-use bigdecimal::{BigDecimal, Zero};
+// use bigdecimal::{BigDecimal, Zero};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
@@ -149,6 +149,7 @@ pub async fn create_or_update_constitution(
     Path(treasury_id): Path<Uuid>,
     Json(payload): Json<CreateConstitutionRequest>,
 ) -> AppResult<(StatusCode, Json<ConstitutionHistory>)> {
+    info!(treasury = %treasury_id, "Hit create_or_update_constitution");
     // 1. Validate rules
     let validation = validate_constitution(&payload.content);
     if !validation.valid {
@@ -194,7 +195,13 @@ pub async fn create_or_update_constitution(
     let _: () = redis.set(&cache_key, serde_json::to_string(&payload.content).unwrap()).await.unwrap_or(());
 
     // Re-fetch to return
-    let res = get_current_constitution(State(state), _auth, Path(treasury_id)).await?;
+    let res = get_current_constitution(State(state.clone()), _auth, Path(treasury_id)).await?;
+    
+    let _ = state.tx_events.send(crate::TreasuryEvent::ConstitutionUpdate {
+        treasury_id,
+        version: next_version,
+    });
+
     Ok((StatusCode::CREATED, res))
 }
 
@@ -263,9 +270,9 @@ pub async fn get_constitution_history(
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(get_current_constitution).post(create_or_update_constitution))
-        .route("/history", get(get_constitution_history))
-        .route("/rollback/:version", post(rollback_constitution))
+        .route("/:treasury_id", get(get_current_constitution).post(create_or_update_constitution))
+        .route("/:treasury_id/history", get(get_constitution_history))
+        .route("/:treasury_id/rollback/:version", post(rollback_constitution))
 }
 
 #[cfg(test)]

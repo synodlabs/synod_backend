@@ -8,27 +8,49 @@ pub mod horizon;
 pub mod resync;
 pub mod constitution;
 pub mod proposal;
+pub mod agent;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
+use uuid::Uuid;
+use serde::{Serialize, Deserialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TreasuryEvent {
+    PoolBalanceUpdate {
+        treasury_id: Uuid,
+        pool_key: String,
+        amount: f64,
+        asset_code: String,
+    },
+    ConstitutionUpdate {
+        treasury_id: Uuid,
+        version: i32,
+    },
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     pub redis: ConnectionManager,
     pub config: config::Settings,
+    pub tx_events: tokio::sync::broadcast::Sender<TreasuryEvent>,
 }
 
 use axum::{routing::get, Router};
 
 pub fn router(state: AppState) -> Router {
+    let treasury_v1 = Router::new()
+        .merge(treasury::router())
+        .merge(constitution::router())
+        .merge(proposal::router());
+
     Router::new()
         .route("/", get(root))
         .nest("/v1/auth", auth::router())
-        .nest("/v1/treasuries", treasury::router())
-        .nest("/v1/treasuries/:id/constitution", constitution::router())
-        .nest("/v1/treasuries", proposal::router())
+        .nest("/v1/treasuries", treasury_v1)
         .nest("/v1/wallets", wallet::router())
+        .nest("/v1/agents", agent::router())
         .nest("/admin", resync::router())
         .with_state(state)
 }

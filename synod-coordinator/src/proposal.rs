@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc, Duration};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::auth::AuthUser;
 use crate::error::{AppError, AppResult};
@@ -278,6 +278,11 @@ pub async fn sign_proposal(
         let mut redis = state.redis.clone();
         let cache_key = format!("constitution:{}", treasury_id);
         let _: () = redis.set(&cache_key, serde_json::to_string(&content).unwrap()).await.unwrap_or(());
+
+        let _ = state.tx_events.send(crate::TreasuryEvent::ConstitutionUpdate {
+            treasury_id,
+            version: next_version,
+        });
     }
 
     // Re-fetch to return updated proposal
