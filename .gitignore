@@ -1,0 +1,32 @@
+# .gitignore
+
+# Cargo & Rust
+/target/
+**/*.rs.bk
+
+# Node & JS
+node_modules/
+dist/
+.env
+
+# MacOS & Windows
+.DS_Store
+Thumbs.db
+
+# Developer specific
+.vscode/
+.idea/
+
+# Synod specific
+.synod-os/
+logs/
+.gemini/
+.agents/
+__synod_doc_extract.txt
+*.docx
+
+# Security
+*.pem
+*.key
+!config/default.toml
+!tests/fixtures/
