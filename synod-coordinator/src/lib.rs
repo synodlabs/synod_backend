@@ -4,6 +4,8 @@ pub mod auth;
 pub mod wallet;
 pub mod treasury;
 pub mod stellar;
+pub mod horizon;
+pub mod resync;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -23,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1/auth", auth::router())
         .nest("/v1/treasuries", treasury::router())
         .nest("/v1/wallets", wallet::router())
+        .nest("/admin", resync::router())
         .with_state(state)
 }
 

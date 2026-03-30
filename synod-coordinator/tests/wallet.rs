@@ -42,6 +42,9 @@ async fn spawn_test_server() -> String {
         .unwrap();
 
     let redis_client = redis::Client::open(settings.redis.url.as_str()).unwrap();
+    let mut redis_client_conn = redis_client.get_connection().unwrap();
+    redis::cmd("FLUSHALL").query::<()>(&mut redis_client_conn).unwrap();
+
     let redis_manager = ConnectionManager::new(redis_client).await.unwrap();
 
     let state = AppState {
@@ -72,13 +75,20 @@ async fn test_phase_3_wallet_flow() {
     let register_res = client.post(format!("{}/v1/auth/register", base_url))
         .json(&json!({ "email": email, "password": "password123" }))
         .send().await.unwrap();
-    assert_eq!(register_res.status(), StatusCode::OK);
+    let reg_status = register_res.status();
+    let reg_body = register_res.text().await.unwrap();
+    println!("Register response: {} - {}", reg_status, reg_body);
+    assert_eq!(reg_status, StatusCode::OK);
     
     let login_res = client.post(format!("{}/v1/auth/login", base_url))
         .json(&json!({ "email": email, "password": "password123" }))
         .send().await.unwrap();
-    let login_body: serde_json::Value = login_res.json().await.unwrap();
-    let token = login_body["token"].as_str().unwrap();
+    let login_status = login_res.status();
+    let login_text = login_res.text().await.unwrap();
+    println!("Login response: {} - {}", login_status, login_text);
+    
+    let login_body: serde_json::Value = serde_json::from_str(&login_text).unwrap();
+    let token = login_body["token"].as_str().expect("Token missing in login response");
 
     // 2. Create Treasury
     let treasury_res = client.post(format!("{}/v1/treasuries", base_url))
