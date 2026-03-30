@@ -1,8 +1,7 @@
-use axum::{routing::get, Router};
 use synod_coordinator::config::Settings;
-use synod_coordinator::{auth, config, AppState};
+use synod_coordinator::{config, AppState};
 use redis::aio::ConnectionManager;
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -73,10 +72,7 @@ async fn main() -> anyhow::Result<()> {
         config: settings.clone(),
     };
 
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .nest("/v1/auth", auth::router())
-        .with_state(state);
+    let app = synod_coordinator::router(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], settings.server.port));
     info!("Server listening on {}", addr);
@@ -85,11 +81,4 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-async fn health_check() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION")
-    }))
 }

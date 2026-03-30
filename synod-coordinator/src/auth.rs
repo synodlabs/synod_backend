@@ -1,15 +1,14 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, State},
-    http::{request::Parts, StatusCode},
-    response::IntoResponse,
+    http::request::Parts,
     Json,
     routing::post,
     Router,
 };
 use axum_extra::headers::{authorization::Bearer, Authorization};
 use axum_extra::TypedHeader;
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{hash, verify};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
 use redis::AsyncCommands;
