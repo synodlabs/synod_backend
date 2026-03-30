@@ -1,21 +1,12 @@
-mod config;
-mod error;
-
 use axum::{routing::get, Router};
-use config::Settings;
+use synod_coordinator::config::Settings;
+use synod_coordinator::{auth, config, AppState};
 use redis::aio::ConnectionManager;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::net::SocketAddr;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use dotenvy::dotenv;
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: PgPool,
-    pub redis: ConnectionManager,
-    pub config: Settings,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -84,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_check))
+        .nest("/v1/auth", auth::router())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], settings.server.port));
