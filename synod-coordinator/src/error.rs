@@ -70,6 +70,10 @@ pub enum AppError {
 
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
+    #[error("Not Found: {0}")]
+    NotFound(String),
+    #[error("Invalid Input: {0}")]
+    InvalidInput(String),
 }
 
 impl IntoResponse for AppError {
@@ -94,6 +98,8 @@ impl IntoResponse for AppError {
             AppError::OwnershipVerificationFailed => (StatusCode::FORBIDDEN, "OWNERSHIP_FAILED"),
             AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
             AppError::Redis(_) => (StatusCode::INTERNAL_SERVER_ERROR, "REDIS_ERROR"),
+            AppError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+            AppError::InvalidInput(_) => (StatusCode::BAD_REQUEST, "INVALID_INPUT"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
 

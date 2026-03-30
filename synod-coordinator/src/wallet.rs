@@ -57,7 +57,7 @@ pub async fn get_nonce(
 
 pub async fn verify_ownership(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Json(payload): Json<VerifyOwnershipRequest>,
 ) -> AppResult<Json<VerifyOwnershipResponse>> {
     let mut redis_conn = state.redis.clone();
@@ -74,6 +74,28 @@ pub async fn verify_ownership(
     // Verify Ed25519 signature
     stellar::verify_stellar_signature(&payload.wallet_address, payload.nonce.as_bytes(), &payload.signature)?;
     
+    // Update status to ACTIVE for any treasury using this wallet
+    sqlx::query(
+        "UPDATE treasury_wallets SET status = 'ACTIVE' WHERE wallet_address = $1"
+    )
+    .bind(&payload.wallet_address)
+    .execute(&state.db)
+    .await?;
+
+    // Also update/insert a verified connection for this user
+    sqlx::query(
+        r#"
+        INSERT INTO wallet_connections (user_id, wallet_address, status, verified_at, wc_session_topic, wc_session_expiry, ownership_sig, ownership_sig_hash)
+        VALUES ($1, $2, 'ACTIVE', NOW(), '', NOW(), $3, '')
+        ON CONFLICT (wallet_address) DO UPDATE SET status = 'ACTIVE', verified_at = NOW(), ownership_sig = $3
+        "#
+    )
+    .bind(auth.user_id)
+    .bind(&payload.wallet_address)
+    .bind(&payload.signature)
+    .execute(&state.db)
+    .await?;
+
     Ok(Json(VerifyOwnershipResponse { verified: true }))
 }
 

@@ -61,16 +61,12 @@ CREATE TABLE treasury_wallets (
 );
 
 CREATE TABLE constitution_history (
-  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  treasury_id       UUID NOT NULL REFERENCES treasuries(treasury_id),
-  version           INTEGER NOT NULL,
-  constitution_hash VARCHAR(64) NOT NULL,
-  constitution_json JSONB NOT NULL,
-  governance_mode   VARCHAR(20) NOT NULL,
-  updater_pubkey    VARCHAR(56) NOT NULL,
-  rollback_from     INTEGER,
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE(treasury_id, version)
+    version           INTEGER NOT NULL,
+    treasury_id       UUID NOT NULL REFERENCES treasuries(treasury_id),
+    state_hash        VARCHAR(64) NOT NULL,
+    content           JSONB NOT NULL,
+    executed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (treasury_id, version)
 );
 
 CREATE TABLE agent_slots (
@@ -158,4 +154,23 @@ CREATE TABLE halt_log (
   triggered_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   resumed_at            TIMESTAMPTZ,
   resumed_by            VARCHAR(56)
+);
+
+-- Phase 5 Governance
+CREATE TABLE proposals (
+    proposal_id UUID PRIMARY KEY,
+    treasury_id UUID NOT NULL REFERENCES treasuries(treasury_id),
+    proposer_id UUID NOT NULL REFERENCES users(user_id),
+    proposed_content JSONB NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE proposal_signatures (
+    signature_id UUID PRIMARY KEY,
+    proposal_id UUID NOT NULL REFERENCES proposals(proposal_id),
+    signer_wallet VARCHAR(56) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(proposal_id, signer_wallet)
 );
