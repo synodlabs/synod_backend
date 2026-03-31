@@ -9,6 +9,7 @@ pub mod resync;
 pub mod constitution;
 pub mod proposal;
 pub mod agent;
+pub mod policy;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
