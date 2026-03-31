@@ -32,6 +32,7 @@ reqwest = { version = "0.12.0", features = ["json"] }
 reqwest-eventsource = "0.6.0"
 futures = "0.3"
 hex = "0.4.3"
+http = "1.1"
 
 [dev-dependencies]
 rand = "0.8.5"
