@@ -21,8 +21,8 @@ pub struct PoolConfig {
     pub target_pct: f64,
     pub floor_pct: f64,
     pub ceiling_pct: f64,
-    #[serde(default)]
-    pub drift_bounds_pct: f64,
+    #[serde(default, alias = "drift_bounds_pct")]
+    pub drift_threshold_pct: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -71,17 +71,17 @@ pub fn validate_constitution(content: &ConstitutionContent) -> ValidationResult 
             ));
         }
 
-        if pool.drift_bounds_pct > (pool.ceiling_pct - pool.target_pct) {
+        if pool.drift_threshold_pct > (pool.ceiling_pct - pool.target_pct) {
             errors.push(format!(
                 "Pool {}: drift bounds ({}) exceed target-to-ceiling margin ({})",
-                pool.pool_key, pool.drift_bounds_pct, pool.ceiling_pct - pool.target_pct
+                pool.pool_key, pool.drift_threshold_pct, pool.ceiling_pct - pool.target_pct
             ));
         }
 
-        if pool.drift_bounds_pct > (pool.target_pct - pool.floor_pct) {
+        if pool.drift_threshold_pct > (pool.target_pct - pool.floor_pct) {
             errors.push(format!(
                 "Pool {}: drift bounds ({}) exceed target-to-floor margin ({})",
-                pool.pool_key, pool.drift_bounds_pct, pool.target_pct - pool.floor_pct
+                pool.pool_key, pool.drift_threshold_pct, pool.target_pct - pool.floor_pct
             ));
         }
     }
@@ -173,6 +173,8 @@ pub async fn create_or_update_constitution(
     // or not exist directly, and instead be applied by the Proposal Executor.
     // We implement it here to satisfy CRUD requirements before Proposal implementation.
     
+    let mut tx = state.db.begin().await?;
+
     sqlx::query(
         r#"
         INSERT INTO constitution_history (treasury_id, version, state_hash, content) 
@@ -183,8 +185,17 @@ pub async fn create_or_update_constitution(
     .bind(next_version)
     .bind(&hash)
     .bind(&content_json)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+
+    sqlx::query("UPDATE treasuries SET constitution_version = $1, updated_at = $2 WHERE treasury_id = $3")
+        .bind(next_version)
+        .bind(Utc::now())
+        .bind(treasury_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
 
     info!(treasury = %treasury_id, version = %next_version, "Constitution updated");
 
@@ -270,9 +281,9 @@ pub async fn get_constitution_history(
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/:treasury_id", get(get_current_constitution).post(create_or_update_constitution))
-        .route("/:treasury_id/history", get(get_constitution_history))
-        .route("/:treasury_id/rollback/:version", post(rollback_constitution))
+        .route("/:treasury_id/constitution", get(get_current_constitution).post(create_or_update_constitution))
+        .route("/:treasury_id/constitution/history", get(get_constitution_history))
+        .route("/:treasury_id/constitution/rollback/:version", post(rollback_constitution))
 }
 
 #[cfg(test)]

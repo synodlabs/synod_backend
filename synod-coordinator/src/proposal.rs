@@ -273,6 +273,14 @@ pub async fn sign_proposal(
         .execute(&state.db)
         .await?;
 
+        // Update Treasury Version
+        sqlx::query("UPDATE treasuries SET constitution_version = $1, updated_at = $2 WHERE treasury_id = $3")
+            .bind(next_version)
+            .bind(Utc::now())
+            .bind(treasury_id)
+            .execute(&state.db)
+            .await?;
+
         // Cache new constitution in Redis
         use redis::AsyncCommands;
         let mut redis = state.redis.clone();

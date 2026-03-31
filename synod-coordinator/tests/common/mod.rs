@@ -1,8 +1,9 @@
 use synod_coordinator::config::Settings;
 use sqlx::postgres::PgPoolOptions;
-use synod_coordinator::AppState;
+use synod_coordinator::{AppState, auth::AuthUser};
 use redis::aio::ConnectionManager;
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 pub async fn spawn_test_server() -> String {
     let _ = tracing_subscriber::fmt()
@@ -100,4 +101,39 @@ pub fn sign_with_key(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) ->
     use ed25519_dalek::Signer;
     let signature = signing_key.sign(message);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes())
+}
+pub struct TestContext {
+    pub base_url: String,
+    pub client: reqwest::Client,
+    pub db: sqlx::PgPool,
+    pub user_token: String,
+}
+
+pub async fn setup_test_context() -> TestContext {
+    let base_url = spawn_test_server().await;
+    let client = reqwest::Client::new();
+    
+    // Connect to the same DB used by the test server (synod_db)
+    let db_url = "postgres://postgres:postgres@localhost:5432/synod_db";
+    let db = sqlx::PgPool::connect(db_url).await.unwrap();
+    
+    // 1. Register and Login
+    let email = format!("test_{}@example.com", Uuid::new_v4());
+    client.post(format!("{}/v1/auth/register", base_url))
+        .json(&serde_json::json!({ "email": email, "password": "password123" }))
+        .send().await.unwrap();
+    
+    let login_resp = client.post(format!("{}/v1/auth/login", base_url))
+        .json(&serde_json::json!({ "email": email, "password": "password123" }))
+        .send().await.unwrap();
+    
+    let login_data: serde_json::Value = login_resp.json().await.unwrap();
+    let token = login_data["token"].as_str().unwrap().to_string();
+
+    TestContext {
+        base_url,
+        client,
+        db,
+        user_token: token,
+    }
 }

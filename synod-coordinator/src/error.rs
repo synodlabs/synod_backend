@@ -81,6 +81,12 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if matches!(self, AppError::Internal(_)) {
+            tracing::error!("Internal Server Error: {:?}", self);
+        } else {
+            tracing::warn!("AppError: {:?}", self);
+        }
+
         let (status, error_code) = match &self {
             AppError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "INVALID_CREDENTIALS"),
             AppError::TokenExpired => (StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED"),

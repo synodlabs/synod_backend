@@ -10,6 +10,7 @@ pub mod constitution;
 pub mod proposal;
 pub mod agent;
 pub mod policy;
+pub mod permit;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -52,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1/treasuries", treasury_v1)
         .nest("/v1/wallets", wallet::router())
         .nest("/v1/agents", agent::router())
+        .nest("/v1/permits", permit::router())
         .nest("/admin", resync::router())
         .with_state(state)
 }

@@ -75,7 +75,22 @@ async fn main() -> anyhow::Result<()> {
         tx_events,
     };
 
-    let app = synod_coordinator::router(state);
+    let app = synod_coordinator::router(state.clone());
+
+    // Spawn Background Permit TTL Watcher
+    let db_pool_clone = state.db.clone();
+    tokio::spawn(async move {
+        info!("Permit TTL Watcher started");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = sqlx::query!(
+                "UPDATE permits SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at < NOW()"
+            ).execute(&db_pool_clone).await {
+                tracing::error!("Failed to expire permits: {}", e);
+            }
+        }
+    });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], settings.server.port));
     info!("Server listening on {}", addr);
