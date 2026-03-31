@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --color-synod-bg: #050505;
+  --color-synod-accent: #00ffcc;
+  --color-synod-error: #ff3366;
+  --color-synod-card: rgba(255, 255, 255, 0.05);
+  --color-synod-border: rgba(255, 255, 255, 0.1);
+  --color-synod-hover: rgba(0, 255, 204, 0.1);
+
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --radius-xl: 1rem;
+  --radius-2xl: 1.5rem;
+
+  --animate-pulse-slow: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-glow: glow 2s ease-in-out infinite alternate;
+}
+
+@layer base {
+  :root {
+    --background: 0 0% 2%;
+    --foreground: 0 0% 98%;
+    --card: 0 0% 4%;
+    --card-foreground: 0 0% 98%;
+    --popover: 0 0% 4%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 168 100% 50%;
+    --primary-foreground: 168 100% 10%;
+    --secondary: 0 0% 10%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 10%;
+    --muted-foreground: 0 0% 60%;
+    --accent: 168 100% 50%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 345 100% 60%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 15%;
+    --input: 0 0% 15%;
+    --ring: 168 100% 50%;
+    --radius: 0.75rem;
+  }
+}
+
+@keyframes glow {
+  from { box-shadow: 0 0 10px rgba(0, 255, 204, 0.2); }
+  to { box-shadow: 0 0 20px rgba(0, 255, 204, 0.4); }
+}
+
+body {
+  background-color: #050505;
+  color: #ededed;
+  font-family: var(--font-sans);
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+.glass-card {
+  @apply bg-synod-card backdrop-blur-xl border border-synod-border rounded-2xl transition-all duration-300;
+}
+
+.glass-card:hover {
+  @apply border-synod-accent/30 shadow-[0_0_20px_rgba(0,255,204,0.1)];
+}
