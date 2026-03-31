@@ -189,14 +189,52 @@ pub async fn report_outcome(
     Path(permit_id): Path<Uuid>,
     Json(payload): Json<OutcomeReport>,
 ) -> AppResult<StatusCode> {
+    let mut tx = state.db.begin().await?;
+
+    // 1. Fetch info for drawdown check
+    let treasury_info = sqlx::query(
+        "SELECT t.treasury_id, t.peak_aum_usd::float8, t.current_aum_usd::float8, (c.content->>'max_drawdown_pct')::float8 as max_drawdown_pct
+         FROM treasuries t
+         JOIN permits p ON p.treasury_id = t.treasury_id
+         JOIN constitution_history c ON c.treasury_id = t.treasury_id AND c.version = t.constitution_version
+         WHERE p.permit_id = $1"
+    )
+    .bind(permit_id)
+    .fetch_one(&mut *tx).await?;
+
+    let treasury_id: Uuid = treasury_info.get("treasury_id");
+    let peak_aum: f64 = treasury_info.get("peak_aum_usd");
+    let current_aum: f64 = treasury_info.get("current_aum_usd");
+    let max_drawdown: f64 = treasury_info.get("max_drawdown_pct");
+    let pnl: f64 = payload.pnl_usd.to_string().parse::<f64>().unwrap_or(0.0);
+
+    let new_aum = current_aum + pnl;
+
+    // 2. Update Permit
     sqlx::query(
         "UPDATE permits SET status = 'CONSUMED', tx_hash = $1, pnl_usd = $2, consumed_at = NOW() WHERE permit_id = $3"
     )
     .bind(&payload.tx_hash)
-    .bind(payload.pnl_usd.to_string().parse::<f64>().unwrap_or(0.0))
+    .bind(pnl)
     .bind(permit_id)
-    .execute(&state.db).await?;
+    .execute(&mut *tx).await?;
 
+    // 3. Update Treasury AUM
+    sqlx::query("UPDATE treasuries SET current_aum_usd = $1, updated_at = NOW() WHERE treasury_id = $2")
+        .bind(new_aum)
+        .bind(treasury_id)
+        .execute(&mut *tx).await?;
+
+    // 4. Check Drawdown Trigger
+    if peak_aum > 0.0 {
+        let drawdown_pct = (peak_aum - new_aum) / peak_aum * 100.0;
+        if drawdown_pct >= max_drawdown {
+            info!("CRITICAL: Drawdown threshold reached ({:.2}%) for treasury {}. Triggering Halt.", drawdown_pct, treasury_id);
+            crate::treasury::apply_halt(&mut tx, treasury_id).await?;
+        }
+    }
+
+    tx.commit().await?;
     info!("Outcome reported for permit {}: PnL {}", permit_id, payload.pnl_usd);
     Ok(StatusCode::OK)
 }
