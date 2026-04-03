@@ -30,8 +30,10 @@ pub struct RedisConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct StellarConfig {
     pub network: String,
+    pub network_passphrase: String, // Added this
     pub horizon_url: String,
     pub coordinator_pubkey: String,
+    pub coordinator_secret_key: String,
     pub coordinator_secret_key_path: String,
 }
 

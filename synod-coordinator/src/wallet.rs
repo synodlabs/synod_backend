@@ -72,7 +72,12 @@ pub async fn verify_ownership(
     let _: redis::RedisResult<()> = redis_conn.del(&key).await;
 
     // Verify Ed25519 signature
-    stellar::verify_stellar_signature(&payload.wallet_address, payload.nonce.as_bytes(), &payload.signature)?;
+    stellar::verify_stellar_signature(
+        &payload.wallet_address, 
+        payload.nonce.as_bytes(), 
+        &payload.signature,
+        &state.config.stellar.network_passphrase,
+    )?;
     
     // Update status to ACTIVE for any treasury using this wallet
     sqlx::query(
@@ -82,21 +87,52 @@ pub async fn verify_ownership(
     .execute(&state.db)
     .await?;
 
+    // Transition PENDING_WALLET treasuries to HEALTHY if they now have an active wallet
+    sqlx::query(
+        r#"
+        UPDATE treasuries 
+        SET health = 'HEALTHY', updated_at = NOW() 
+        WHERE health = 'PENDING_WALLET' 
+        AND treasury_id IN (SELECT treasury_id FROM treasury_wallets WHERE wallet_address = $1 AND status = 'ACTIVE')
+        "#
+    )
+    .bind(&payload.wallet_address)
+    .execute(&state.db)
+    .await?;
+
     // Also update/insert a verified connection for this user
     sqlx::query(
         r#"
-        INSERT INTO wallet_connections (user_id, wallet_address, status, verified_at, wc_session_topic, wc_session_expiry, ownership_sig, ownership_sig_hash)
-        VALUES ($1, $2, 'ACTIVE', NOW(), '', NOW(), $3, '')
-        ON CONFLICT (wallet_address) DO UPDATE SET status = 'ACTIVE', verified_at = NOW(), ownership_sig = $3
+        INSERT INTO wallet_connections (user_id, wallet_address, status, verified_at, wc_session_topic, wc_session_expiry, ownership_sig, ownership_sig_hash, network)
+        VALUES ($1, $2, 'ACTIVE', NOW(), '', NOW(), $3, '', $4)
+        ON CONFLICT (wallet_address) DO UPDATE SET status = 'ACTIVE', verified_at = NOW(), ownership_sig = $3, network = $4
         "#
     )
     .bind(auth.user_id)
     .bind(&payload.wallet_address)
     .bind(&payload.signature)
+    .bind(&state.config.stellar.network)
     .execute(&state.db)
     .await?;
 
     Ok(Json(VerifyOwnershipResponse { verified: true }))
+}
+
+pub async fn check_verified(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<NonceRequest>,
+) -> AppResult<Json<VerifyOwnershipResponse>> {
+    let exists = sqlx::query!(
+        "SELECT 1 as id FROM wallet_connections WHERE user_id = $1 AND wallet_address = $2 AND status = 'ACTIVE'",
+        auth.user_id,
+        payload.wallet_address
+    )
+    .fetch_optional(&state.db)
+    .await?
+    .is_some();
+
+    Ok(Json(VerifyOwnershipResponse { verified: exists }))
 }
 
 pub async fn connect_wallet(
@@ -148,6 +184,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/nonce", post(get_nonce))
         .route("/verify-ownership", post(verify_ownership))
+        .route("/check-verified", post(check_verified))
         .route("/connect", post(connect_wallet))
         .route("/heartbeat", post(heartbeat_wallet))
         .route("/disconnect", post(disconnect_wallet))

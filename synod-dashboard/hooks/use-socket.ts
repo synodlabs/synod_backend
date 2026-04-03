@@ -10,14 +10,9 @@ export function useSocket(token: string | null) {
   useEffect(() => {
     if (!token) return
 
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
-    const wsUrl = `${protocol}//${window.location.host}/v1/dashboard/ws?auth=${token}`
-    
-    // In some cases the auth might be passed via header, but standard JS WebSocket doesn't support headers.
-    // The backend `dashboard.rs` doesn't seem to extract auth from query, but let's check.
-    // Actually, axum's `WebSocketUpgrade` usually matches the route.
-    // The previous `App.tsx` used `new WebSocket(wsUrl)` without extra auth in URL.
-    // Let's re-check `dashboard.rs` to see how it handles auth for WS.
+    // Connect directly to the backend port (8080) for local development
+    // since Next.js rewrites don't support WebSocket proxying out of the box.
+    const wsUrl = `ws://localhost:8080/v1/dashboard/ws?auth=${token}`
     
     ws.current = new WebSocket(wsUrl)
 

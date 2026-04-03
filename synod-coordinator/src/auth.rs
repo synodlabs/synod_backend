@@ -6,13 +6,14 @@ use axum::{
     routing::post,
     Router,
 };
-use axum_extra::headers::{authorization::Bearer, Authorization};
+use axum_extra::headers::Authorization;
 use axum_extra::TypedHeader;
 use bcrypt::{hash, verify};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -26,18 +27,35 @@ pub struct AuthUser {
     pub user_id: Uuid,
 }
 
+pub struct AgentAuth {
+    pub agent_id: Uuid,
+    pub treasury_id: Uuid,
+}
+
 #[async_trait]
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        let TypedHeader(Authorization(bearer)) = 
-            <TypedHeader<Authorization<Bearer>> as FromRequestParts<AppState>>::from_request_parts(parts, state)
-            .await
-            .map_err(|_| AppError::TokenInvalid)?;
+        // 1. Try Header
+        let token = if let Some(auth_header) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+            let auth_str = auth_header.to_str().map_err(|_| AppError::TokenInvalid)?;
+            if !auth_str.starts_with("Bearer ") {
+                return Err(AppError::TokenInvalid);
+            }
+            auth_str[7..].to_string()
+        } else {
+            // 2. Try Query Parameter (fallback for WebSockets)
+            let query = parts.uri.query().unwrap_or("");
+            let auth_param = query.split('&')
+                .find(|part| part.starts_with("auth="))
+                .map(|part| part[5..].to_string());
+            
+            auth_param.ok_or(AppError::TokenInvalid)?
+        };
 
         let token_data = decode::<Claims>(
-            bearer.token(),
+            &token,
             &DecodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
             &Validation::default(),
         ).map_err(|e| match e.kind() {
@@ -45,7 +63,66 @@ impl FromRequestParts<AppState> for AuthUser {
             _ => AppError::TokenInvalid,
         })?;
 
-        Ok(AuthUser { user_id: token_data.claims.sub })
+        let user_id = token_data.claims.sub;
+
+        // 3. Verify user exists in DB to prevent stale tokens/FK violations
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE user_id = $1)")
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e))?;
+
+        if !exists {
+            return Err(AppError::TokenInvalid);
+        }
+
+        Ok(AuthUser { user_id })
+    }
+}
+
+#[async_trait]
+impl FromRequestParts<AppState> for AgentAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let auth_header = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .ok_or(AppError::InvalidApiKey)?;
+
+        let auth_str = auth_header.to_str().map_err(|_| AppError::InvalidApiKey)?;
+        if !auth_str.starts_with("Bearer ") {
+            return Err(AppError::InvalidApiKey);
+        }
+
+        let api_key = &auth_str[7..];
+        let mut hasher = Sha256::new();
+        hasher.update(api_key.as_bytes());
+        let fast_token_hash = hex::encode(hasher.finalize());
+
+        let row = sqlx::query(
+            "SELECT agent_id, treasury_id, api_key_hash, status FROM agent_slots WHERE fast_token_hash = $1"
+        )
+        .bind(fast_token_hash)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::InvalidApiKey)?;
+
+        let hash: String = row.get("api_key_hash");
+        if !verify(api_key, &hash).unwrap_or(false) {
+            return Err(AppError::InvalidApiKey);
+        }
+
+        match row.get::<String, _>("status").as_str() {
+            "SUSPENDED" => return Err(AppError::AgentSuspended),
+            "REVOKED" => return Err(AppError::AgentRevoked),
+            _ => {}
+        }
+
+        Ok(AgentAuth {
+            agent_id: row.get("agent_id"),
+            treasury_id: row.get("treasury_id"),
+        })
     }
 }
 

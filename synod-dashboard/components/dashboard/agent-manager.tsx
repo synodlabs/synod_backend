@@ -1,82 +1,795 @@
 "use client"
 
-import { useState } from "react"
-import { Cpu, Key, Terminal, Plus } from "lucide-react"
+import { useEffect, useMemo, useState } from "react"
+import { AlertTriangle, CheckCircle2, Copy, Plus, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 
-interface AgentManagerProps {
-  treasuryId: string;
-  token: string | null;
+export interface AgentSlot {
+  agent_id: string
+  treasury_id: string
+  name: string
+  description: string | null
+  agent_pubkey: string | null
+  status: string
+  created_at: string
+  last_connected: string | null
 }
 
-export function AgentManager({ treasuryId, token }: AgentManagerProps) {
-  const [loading, setLoading] = useState(false)
-  const [newAgent, setNewAgent] = useState<{ id: string, key: string } | null>(null)
+interface AgentManagerProps {
+  treasuryId: string
+  token: string | null
+  agents: AgentSlot[]
+  onAgentsChange: () => void | Promise<void>
+  onManageRules?: (agentId: string) => void
+  isDashboardWidget?: boolean
+}
 
-  const createAgent = async () => {
-    if (!token) return
-    setLoading(true)
+type ProvisionResult = { agent: AgentSlot; api_key: string }
+type ProvisionStep = "form" | "success"
+type SdkTab = "python" | "nodejs" | "rust"
+type CopyTarget = "agent_id" | "api_key" | null
+type SnippetTone = "comment" | "command" | "env" | "keyword" | "call" | "string" | "number" | "plain"
+
+type SnippetLine = {
+  text: string
+  tone: SnippetTone
+}
+
+const SDK_SNIPPETS: Record<SdkTab, { language: string; lines: SnippetLine[] }> = {
+  python: {
+    language: "Python",
+    lines: [
+      { text: "# Install", tone: "comment" },
+      { text: "pip install synod-sdk", tone: "command" },
+      { text: "", tone: "plain" },
+      { text: "# Configure", tone: "comment" },
+      { text: 'export SYNOD_API_KEY="synod_agent_xxx..."', tone: "env" },
+      { text: "", tone: "plain" },
+      { text: "# Connect and execute", tone: "comment" },
+      { text: "from synod import SynodAgent", tone: "keyword" },
+      { text: "import os", tone: "keyword" },
+      { text: "", tone: "plain" },
+      { text: "agent = SynodAgent(", tone: "plain" },
+      { text: '    api_key=os.environ["SYNOD_API_KEY"],', tone: "plain" },
+      { text: '    key_storage_path="./synod_keys",', tone: "string" },
+      { text: ")", tone: "plain" },
+      { text: "", tone: "plain" },
+      { text: "await agent.connect()", tone: "call" },
+      { text: "await agent.execute(", tone: "call" },
+      { text: '    wallet="G...",', tone: "string" },
+      { text: '    destination="G...",', tone: "string" },
+      { text: "    amount=250.0,", tone: "number" },
+      { text: '    asset="XLM",', tone: "string" },
+      { text: ")", tone: "plain" },
+    ],
+  },
+  nodejs: {
+    language: "Node.js",
+    lines: [
+      { text: "// Node.js SDK", tone: "comment" },
+      { text: "// Python is the primary implementation today.", tone: "comment" },
+      { text: "", tone: "plain" },
+      { text: "const agent = new SynodAgent(process.env.SYNOD_API_KEY)", tone: "keyword" },
+      { text: "await agent.connect()", tone: "call" },
+      { text: "await agent.execute({ wallet, destination, amount, asset })", tone: "call" },
+    ],
+  },
+  rust: {
+    language: "Rust",
+    lines: [
+      { text: "// Rust SDK", tone: "comment" },
+      { text: "// Python is the primary implementation today.", tone: "comment" },
+      { text: "", tone: "plain" },
+      { text: 'let agent = SynodAgent::new(std::env::var("SYNOD_API_KEY")?);', tone: "keyword" },
+      { text: "agent.connect().await?;", tone: "call" },
+      { text: "agent.execute(wallet, destination, amount, asset).await?;", tone: "call" },
+    ],
+  },
+}
+
+function truncateMiddle(value: string, left = 6, right = 4) {
+  if (value.length <= left + right + 3) return value
+  return `${value.slice(0, left)}...${value.slice(-right)}`
+}
+
+function formatRelativeTime(value: string | null) {
+  if (!value) return "Never connected"
+
+  const timestamp = new Date(value).getTime()
+  if (Number.isNaN(timestamp)) return "Never connected"
+
+  const diffMs = Date.now() - timestamp
+  const diffMinutes = Math.floor(diffMs / 60000)
+
+  if (diffMinutes < 1) return "Just now"
+  if (diffMinutes < 60) return `${diffMinutes}m ago`
+
+  const diffHours = Math.floor(diffMinutes / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+
+  const diffDays = Math.floor(diffHours / 24)
+  return `${diffDays}d ago`
+}
+
+function formatDate(value: string | null) {
+  if (!value) return "Never connected"
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return "Never connected"
+
+  return date.toLocaleString()
+}
+
+function displayStatus(status: string) {
+  if (status.startsWith("PENDING")) return "PENDING"
+  return status
+}
+
+function statusClasses(status: string) {
+  if (status === "ACTIVE") return "border-emerald-500/25 bg-emerald-500/10 text-emerald-300"
+  if (status.startsWith("PENDING")) return "border-synod-warning/30 bg-synod-warning/10 text-synod-warning"
+  if (status === "INACTIVE") return "border-zinc-700 bg-zinc-900 text-zinc-300"
+  if (status === "REVOKED") return "border-red-500/25 bg-red-500/10 text-red-300"
+  if (status === "SUSPENDED") return "border-amber-500/25 bg-amber-500/10 text-amber-200"
+  return "border-sky-500/25 bg-sky-500/10 text-sky-200"
+}
+
+function buildAgentToken(agentId: string) {
+  const compact = agentId.replace(/-/g, "")
+  return `${compact.slice(0, 8)}...${compact.slice(-4)}`
+}
+
+function snippetToneClass(tone: SnippetTone) {
+  switch (tone) {
+    case "comment":
+      return "text-synod-muted-dark"
+    case "command":
+      return "text-white"
+    case "env":
+      return "text-synod-warning"
+    case "keyword":
+      return "text-emerald-300"
+    case "call":
+      return "text-sky-300"
+    case "string":
+      return "text-amber-200"
+    case "number":
+      return "text-fuchsia-300"
+    default:
+      return "text-synod-muted"
+  }
+}
+
+function MiniAgentList({ agents }: { agents: AgentSlot[] }) {
+  return (
+    <section className="bg-synod-card border border-synod-border rounded-md overflow-hidden flex flex-col">
+      <div className="p-5 border-b border-synod-border flex justify-between items-center bg-white/[0.01]">
+        <div>
+          <h2 className="text-sm font-bold text-white tracking-tight">Connected Agents</h2>
+          <p className="text-[10px] text-synod-muted uppercase tracking-widest mt-1">
+            {agents.length} configured slots
+          </p>
+        </div>
+      </div>
+
+      <div className="custom-scrollbar overflow-y-auto max-h-[258px]" style={{ scrollbarGutter: "stable" }}>
+        <div className="divide-y divide-synod-border">
+          {agents.length === 0 ? (
+            <div className="py-20 text-center bg-synod-card/50">
+              <p className="text-[10px] text-synod-muted font-mono uppercase tracking-[0.2em]">
+                No Agent Slots
+              </p>
+            </div>
+          ) : (
+            agents.map((agent) => (
+              <div key={agent.agent_id} className="p-4 flex items-center gap-4 hover:bg-white/[0.015] transition-all">
+                <div
+                  className={`relative w-2 h-2 rounded-full flex-shrink-0 ${
+                    agent.status === "ACTIVE" ? "bg-white shadow-[0_0_8px_rgba(255,255,255,0.4)]" : "bg-synod-warning opacity-60"
+                  }`}
+                >
+                  {agent.status === "ACTIVE" && <div className="absolute inset-0 rounded-full animate-ping bg-white opacity-20" />}
+                </div>
+
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-bold text-white truncate">{agent.name}</div>
+                  <div className="text-[10px] font-mono text-synod-muted-dark truncate mt-0.5">
+                    {buildAgentToken(agent.agent_id)} - {displayStatus(agent.status).toLowerCase()}
+                  </div>
+                </div>
+
+                <div className="text-[10px] font-mono text-synod-muted uppercase tracking-tighter">
+                  {formatRelativeTime(agent.last_connected)}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+export function AgentManager({
+  treasuryId,
+  token,
+  agents,
+  onAgentsChange,
+  onManageRules,
+  isDashboardWidget = true,
+}: AgentManagerProps) {
+  const [showProvisionModal, setShowProvisionModal] = useState(false)
+  const [showRevokeModal, setShowRevokeModal] = useState(false)
+  const [isProvisioning, setIsProvisioning] = useState(false)
+  const [newAgentName, setNewAgentName] = useState("")
+  const [newAgentDescription, setNewAgentDescription] = useState("")
+  const [provisionResult, setProvisionResult] = useState<ProvisionResult | null>(null)
+  const [provisionStep, setProvisionStep] = useState<ProvisionStep>("form")
+  const [copiedTarget, setCopiedTarget] = useState<CopyTarget>(null)
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
+  const [actionLoading, setActionLoading] = useState<string | null>(null)
+  const [sdkTab, setSdkTab] = useState<SdkTab>("python")
+  const [modalError, setModalError] = useState("")
+  const [revokeTarget, setRevokeTarget] = useState<AgentSlot | null>(null)
+
+  useEffect(() => {
+    if (agents.length === 0) {
+      setSelectedAgentId(null)
+      return
+    }
+
+    const stillExists = selectedAgentId && agents.some((agent) => agent.agent_id === selectedAgentId)
+    if (!stillExists) {
+      setSelectedAgentId(agents[0].agent_id)
+    }
+  }, [agents, selectedAgentId])
+
+  const selectedAgent = useMemo(() => {
+    const found = agents.find((agent) => agent.agent_id === selectedAgentId)
+    if (found) return found
+
+    if (provisionResult && provisionResult.agent.agent_id === selectedAgentId) {
+      return provisionResult.agent
+    }
+
+    return agents[0] ?? null
+  }, [agents, provisionResult, selectedAgentId])
+
+  const resetProvisionModal = () => {
+    setShowProvisionModal(false)
+    setProvisionResult(null)
+    setProvisionStep("form")
+    setNewAgentName("")
+    setNewAgentDescription("")
+    setModalError("")
+    setCopiedTarget(null)
+  }
+
+  const handleProvision = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!token || !newAgentName.trim()) return
+
+    setIsProvisioning(true)
+    setModalError("")
+
     try {
-      const res = await fetch("/v1/agents", {
+      const res = await fetch(`/v1/agents/${treasuryId}`, {
         method: "POST",
-        headers: { 
+        headers: {
+          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}` 
         },
-        body: JSON.stringify({ treasury_id: treasuryId, name: "New Strategy Agent" }),
+        body: JSON.stringify({
+          name: newAgentName.trim(),
+          description: newAgentDescription.trim() || null,
+        }),
       })
-      const data = await res.json()
-      setNewAgent({ id: data.agent_id, key: data.api_key })
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null)
+        throw new Error(data?.message || "Failed to provision agent slot")
+      }
+
+      const result: ProvisionResult = await res.json()
+      setProvisionResult(result)
+      setProvisionStep("success")
+      setSelectedAgentId(result.agent.agent_id)
+      await Promise.resolve(onAgentsChange())
     } catch (err) {
       console.error(err)
+      setModalError(err instanceof Error ? err.message : "Provisioning failed. Please try again.")
     } finally {
-      setLoading(false)
+      setIsProvisioning(false)
     }
   }
 
+  const handleRevoke = async () => {
+    if (!token || !revokeTarget) return
+
+    setActionLoading(revokeTarget.agent_id)
+    setModalError("")
+
+    try {
+      const res = await fetch(`/v1/agents/${treasuryId}/${revokeTarget.agent_id}/revoke`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      })
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null)
+        throw new Error(data?.message || "Failed to revoke agent")
+      }
+
+      setShowRevokeModal(false)
+      setRevokeTarget(null)
+      await Promise.resolve(onAgentsChange())
+    } catch (err) {
+      console.error(err)
+      setModalError(err instanceof Error ? err.message : "Revocation failed. Please try again.")
+    } finally {
+      setActionLoading(null)
+    }
+  }
+
+  const copyToClipboard = async (text: string, target: CopyTarget) => {
+    await navigator.clipboard.writeText(text)
+    setCopiedTarget(target)
+    setTimeout(() => setCopiedTarget(null), 2000)
+  }
+
+  if (isDashboardWidget) {
+    return <MiniAgentList agents={agents} />
+  }
+
   return (
-    <section className="glass-card p-8 bg-black/20">
-      <div className="flex items-center justify-between mb-8">
-        <div className="flex items-center gap-3">
-          <div className="text-synod-accent">
-             <Cpu size={20} />
+    <>
+      <div className="space-y-6">
+        <div className="flex justify-end">
+          <div className="flex items-center gap-3">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9 border border-synod-border bg-white/[0.02] px-4 text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted hover:border-synod-border-strong hover:text-white"
+            >
+              Docs
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => {
+                setShowProvisionModal(true)
+                setProvisionResult(null)
+                setProvisionStep("form")
+                setNewAgentName("")
+                setNewAgentDescription("")
+                setModalError("")
+                setCopiedTarget(null)
+              }}
+              className="h-9 px-4 text-[10px] font-bold uppercase tracking-[0.18em] shadow-none"
+            >
+              <Plus size={12} className="mr-1.5" />
+              Add Agent Slot
+            </Button>
           </div>
-          <h2 className="text-sm font-black text-white uppercase tracking-wider text-muted-foreground">Agent Swarm</h2>
         </div>
-        <Button 
-          onClick={createAgent}
-          disabled={loading}
-          variant="outline"
-          size="sm"
-          className="rounded-xl border-synod-accent/20 text-synod-accent hover:bg-synod-accent/10"
-        >
-          {loading ? "PROVISIONING..." : "ADD SLOT"}
-        </Button>
+
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
+          <div className="space-y-6 min-w-0">
+            <section className="overflow-hidden rounded-md border border-synod-border bg-synod-card">
+              <div className="overflow-hidden">
+                <table className="w-full table-fixed border-collapse">
+                  <thead className="bg-white/[0.02]">
+                    <tr className="border-b border-synod-border text-left">
+                      <th className="w-[38%] px-4 py-3 text-[9px] font-bold uppercase tracking-[0.16em] text-synod-muted">Agent</th>
+                      <th className="w-[18%] px-3 py-3 text-[9px] font-bold uppercase tracking-[0.16em] text-synod-muted">Status</th>
+                      <th className="w-[20%] px-3 py-3 text-[9px] font-bold uppercase tracking-[0.16em] text-synod-muted">Last Connected</th>
+                      <th className="w-[24%] px-4 py-3 text-right text-[9px] font-bold uppercase tracking-[0.16em] text-synod-muted">Actions</th>
+                    </tr>
+                  </thead>
+                </table>
+
+                <div className={`custom-scrollbar overflow-y-auto ${agents.length > 3 ? "max-h-[196px]" : ""}`}>
+                  <table className="w-full table-fixed border-collapse">
+                    <tbody>
+                      {agents.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="px-6 py-20 text-center">
+                            <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-synod-muted">No Agent Slots Yet</div>
+                            <p className="mt-3 text-xs text-synod-muted-dark">Create an agent slot to mint a one-time API key for your agent runtime.</p>
+                          </td>
+                        </tr>
+                      ) : (
+                        agents.map((agent) => {
+                          const isSelected = selectedAgent?.agent_id === agent.agent_id
+
+                          return (
+                            <tr
+                              key={agent.agent_id}
+                              onClick={() => setSelectedAgentId(agent.agent_id)}
+                              className={`cursor-pointer border-b border-synod-border/80 transition-colors last:border-b-0 ${isSelected ? "bg-white/[0.04]" : "hover:bg-white/[0.02]"}`}
+                            >
+                              <td className="px-4 py-3 align-middle">
+                                <div className="truncate text-[11px] font-bold text-white">{agent.name}</div>
+                                <div className="mt-0.5 flex items-center gap-3 text-[9px] font-mono text-synod-muted-dark">
+                                  <span>{buildAgentToken(agent.agent_id)}</span>
+                                  {onManageRules && (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        onManageRules(agent.agent_id)
+                                      }}
+                                      className="text-synod-warning transition-colors hover:text-white"
+                                    >
+                                      Manage Rules
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-3 py-3 align-middle">
+                                <span className={`inline-flex items-center rounded-full border px-2 py-1 text-[8px] font-bold uppercase tracking-[0.16em] ${statusClasses(agent.status)}`}>
+                                  {displayStatus(agent.status)}
+                                </span>
+                              </td>
+                              <td className="px-3 py-3 align-middle">
+                                <div className="font-mono text-[10px] text-synod-muted">{formatRelativeTime(agent.last_connected)}</div>
+                              </td>
+                              <td className="px-4 py-3 align-middle text-right">
+                                <div className="flex justify-end gap-2">
+                                  {onManageRules && (
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        onManageRules(agent.agent_id)
+                                      }}
+                                      className="inline-flex items-center justify-center rounded-[5px] border border-synod-border bg-white/[0.03] px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-white transition-colors hover:border-synod-border-strong"
+                                    >
+                                      Manage Rules
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      setRevokeTarget(agent)
+                                      setShowRevokeModal(true)
+                                      setModalError("")
+                                    }}
+                                    disabled={actionLoading === agent.agent_id}
+                                    className="inline-flex items-center justify-center rounded-[5px] bg-red-600 px-3 py-1.5 text-[9px] font-bold uppercase tracking-[0.14em] text-white transition-colors hover:bg-red-500 disabled:opacity-60"
+                                  >
+                                    Revoke
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          )
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-md border border-synod-border bg-synod-card">
+              <div className="border-b border-synod-border px-5 py-4">
+                <div className="text-sm font-bold text-white">SDK Integration Guide</div>
+                <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">For agent developers</div>
+              </div>
+
+              <div className="p-5">
+                <div className="mb-4 flex flex-wrap gap-2">
+                  {(["python", "nodejs", "rust"] as SdkTab[]).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setSdkTab(tab)}
+                      className={`rounded-full border px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors ${sdkTab === tab ? "border-white bg-white text-black" : "border-synod-border bg-white/[0.02] text-synod-muted hover:text-white"}`}
+                    >
+                      {tab === "nodejs" ? "Node.js" : tab === "python" ? "Python" : "Rust"}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="rounded-md border border-synod-border bg-black px-4 py-4">
+                  <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.16em] text-synod-muted-dark">{SDK_SNIPPETS[sdkTab].language}</div>
+                  <pre className="custom-scrollbar overflow-x-auto font-mono text-[11px] leading-6">
+                    {SDK_SNIPPETS[sdkTab].lines.map((line, index) => (
+                      <div key={`${sdkTab}-${index}`} className={snippetToneClass(line.tone)}>
+                        {line.text || " "}
+                      </div>
+                    ))}
+                  </pre>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <aside className="rounded-md border border-synod-border bg-synod-card">
+            {selectedAgent ? (
+              <>
+                <div className="flex items-center justify-between border-b border-synod-border px-5 py-4">
+                  <div>
+                    <div className="text-sm font-bold text-white">{selectedAgent.name}</div>
+                    <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">Identity-only slot</div>
+                  </div>
+                  <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[9px] font-bold uppercase tracking-[0.18em] ${statusClasses(selectedAgent.status)}`}>
+                    {displayStatus(selectedAgent.status)}
+                  </span>
+                </div>
+
+                <div className="space-y-6 p-5">
+                  <section className="space-y-2">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Agent ID</div>
+                    <div className="rounded-md border border-synod-border bg-black px-4 py-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="font-mono text-[11px] text-white break-all">{selectedAgent.agent_id}</div>
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(selectedAgent.agent_id, "agent_id")}
+                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
+                        >
+                          <Copy size={12} className="mr-1.5" />
+                          {copiedTarget === "agent_id" ? "Copied" : "Copy"}
+                        </button>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section className="space-y-2">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Description</div>
+                    <div className="rounded-md border border-synod-border bg-black px-4 py-3 text-sm text-white">
+                      {selectedAgent.description?.trim() || "No description provided for this slot."}
+                    </div>
+                  </section>
+
+                  <section className="space-y-2">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">API Key</div>
+                    <div className="rounded-md border border-synod-border bg-black px-4 py-3 text-[11px] text-synod-muted-dark">
+                      Raw API keys are shown once at creation time. If this one is lost, revoke the slot and create a new one.
+                    </div>
+                  </section>
+
+                  <section className="space-y-3">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Capital Rules</div>
+                    <div className="rounded-md border border-synod-border bg-black px-4 py-4 space-y-3">
+                      <p className="text-sm leading-6 text-synod-muted">
+                        This page only manages slot identity and credentials. Wallet access, allocation, tier limits, and concurrency rules live in Policy.
+                      </p>
+                      {onManageRules && (
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => onManageRules(selectedAgent.agent_id)}
+                          className="h-10 border border-synod-border px-4 text-[10px] font-bold uppercase tracking-[0.16em]"
+                        >
+                          Manage Rules
+                        </Button>
+                      )}
+                    </div>
+                  </section>
+
+                  <section className="space-y-3">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Connection</div>
+                    <div className="space-y-3 rounded-md border border-synod-border bg-black px-4 py-4">
+                      <div>
+                        <div className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Last Connected</div>
+                        <div className="mt-1 font-mono text-[11px] text-white">{formatDate(selectedAgent.last_connected)}</div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Created At</div>
+                        <div className="mt-1 font-mono text-[11px] text-white">{formatDate(selectedAgent.created_at)}</div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Agent Pubkey</div>
+                        <div className="mt-1 font-mono text-[11px] text-white break-all">{selectedAgent.agent_pubkey ? truncateMiddle(selectedAgent.agent_pubkey, 10, 6) : "Not registered yet"}</div>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+              </>
+            ) : (
+              <div className="flex h-full min-h-[420px] items-center justify-center p-8 text-center">
+                <div>
+                  <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-synod-muted">No Agent Selected</div>
+                  <p className="mt-3 text-xs text-synod-muted-dark">Create a slot or select an existing row to inspect its identity and connection state.</p>
+                </div>
+              </div>
+            )}
+          </aside>
+        </div>
       </div>
 
-      {newAgent && (
-        <div className="mb-6 p-4 bg-synod-accent/10 border border-synod-accent/30 rounded-xl relative overflow-hidden">
-          <div className="absolute top-0 right-0 p-1 bg-synod-accent text-black text-[8px] font-black px-2 uppercase">SECRET_KEY</div>
-          <p className="text-[10px] text-synod-accent font-black uppercase mb-2">Save it now! (One-time view)</p>
-          <div className="flex items-center gap-3 bg-black/60 p-3 rounded-lg font-mono text-xs break-all border border-synod-accent/10">
-            <Key size={14} className="text-synod-accent flex-shrink-0" />
-            {newAgent.key}
+      {showProvisionModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-[560px] rounded-2xl border border-synod-border bg-[#07070b] shadow-2xl">
+            {provisionStep === "form" ? (
+              <form onSubmit={handleProvision}>
+                <div className="flex items-center justify-between border-b border-synod-border px-6 py-5">
+                  <div className="text-2xl font-bold text-white tracking-tight">Create Agent</div>
+                  <button type="button" onClick={resetProvisionModal} className="text-synod-muted transition-colors hover:text-white">
+                    <X size={20} />
+                  </button>
+                </div>
+
+                <div className="space-y-6 px-6 py-6">
+                  <p className="max-w-xl text-sm leading-7 text-synod-muted">
+                    Agent slots create identity and credentials only. Capital rules are configured later in Policy.
+                  </p>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Agent Name</label>
+                    <input
+                      autoFocus
+                      required
+                      maxLength={64}
+                      type="text"
+                      value={newAgentName}
+                      onChange={(event) => setNewAgentName(event.target.value)}
+                      placeholder="e.g. Yield Optimizer Bot"
+                      className="h-14 w-full rounded-xl border border-synod-border bg-black px-4 font-mono text-sm text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
+                    />
+                    <div className="text-[10px] text-synod-muted-dark">Required. Maximum 64 characters.</div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Description</label>
+                    <textarea
+                      maxLength={255}
+                      value={newAgentDescription}
+                      onChange={(event) => setNewAgentDescription(event.target.value)}
+                      placeholder="Optional context for operators and reviewers"
+                      className="min-h-[120px] w-full rounded-xl border border-synod-border bg-black px-4 py-4 text-sm text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
+                    />
+                    <div className="text-[10px] text-synod-muted-dark">Optional. Maximum 255 characters.</div>
+                  </div>
+
+                  {modalError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{modalError}</div>}
+                </div>
+
+                <div className="flex justify-end px-6 pb-6">
+                  <button
+                    type="submit"
+                    disabled={isProvisioning}
+                    className="inline-flex h-12 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200 disabled:opacity-60"
+                  >
+                    {isProvisioning ? "Creating..." : "Create"}
+                  </button>
+                </div>
+              </form>
+            ) : provisionResult ? (
+              <div>
+                <div className="flex items-center justify-between border-b border-synod-border px-6 py-5">
+                  <div className="text-2xl font-bold text-white tracking-tight">Agent Created</div>
+                  <button type="button" onClick={resetProvisionModal} className="text-synod-muted transition-colors hover:text-white">
+                    <X size={20} />
+                  </button>
+                </div>
+
+                <div className="space-y-6 px-6 py-6">
+                  <div className="flex items-start gap-3 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-4">
+                    <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-300" />
+                    <div>
+                      <div className="text-sm font-bold text-white">{provisionResult.agent.name}</div>
+                      <p className="mt-2 text-sm leading-6 text-synod-muted">The slot now exists and will appear as pending until an agent connects and rules are configured in Policy.</p>
+                    </div>
+                  </div>
+
+                  <section className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Agent ID</label>
+                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="min-h-6 font-mono text-sm text-white break-all">{provisionResult.agent.agent_id}</div>
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(provisionResult.agent.agent_id, "agent_id")}
+                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
+                        >
+                          <Copy size={12} className="mr-1.5" />
+                          {copiedTarget === "agent_id" ? "Copied" : "Copy"}
+                        </button>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">API Key</label>
+                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-h-6 font-mono text-sm text-white break-all">{provisionResult.api_key}</div>
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(provisionResult.api_key, "api_key")}
+                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
+                        >
+                          <Copy size={12} className="mr-1.5" />
+                          {copiedTarget === "api_key" ? "Copied" : "Copy"}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs leading-6 text-amber-100">
+                      Copy this now. It will never be shown again. If you lose it you must revoke this slot and create a new one.
+                    </div>
+                  </section>
+                </div>
+
+                <div className="flex justify-end px-6 pb-6">
+                  <button
+                    type="button"
+                    onClick={resetProvisionModal}
+                    className="inline-flex h-12 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       )}
 
-      <div className="space-y-3">
-        <div className="flex items-center justify-between p-4 bg-black/40 rounded-xl border border-white/5 group hover:border-synod-accent/20 transition-colors">
-          <div className="flex items-center gap-4">
-            <Terminal size={18} className="text-muted-foreground group-hover:text-synod-accent transition-colors" />
-            <div>
-              <div className="text-xs font-black text-white uppercase">PRIMARY_STRAT-NODE</div>
-              <div className="text-[9px] text-muted-foreground font-mono tracking-tighter opacity-40">NODE_STATUS: DISCONNECTED</div>
+      {showRevokeModal && revokeTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-synod-border bg-[#07070b] shadow-2xl">
+            <div className="flex items-center justify-between border-b border-synod-border px-6 py-5">
+              <div className="text-xl font-bold text-white">Confirm Revocation</div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowRevokeModal(false)
+                  setRevokeTarget(null)
+                  setModalError("")
+                }}
+                className="text-synod-muted transition-colors hover:text-white"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="space-y-5 px-6 py-6">
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/20 bg-red-500/10 px-4 py-4">
+                <AlertTriangle size={18} className="mt-0.5 shrink-0 text-red-300" />
+                <div>
+                  <div className="text-sm font-bold text-white">{revokeTarget.name}</div>
+                  <p className="mt-2 text-sm leading-6 text-synod-muted">
+                    Revoking this slot disconnects the agent and permanently invalidates its API key. Use this only when the slot should be retired.
+                  </p>
+                </div>
+              </div>
+
+              {modalError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{modalError}</div>}
+            </div>
+
+            <div className="flex justify-end gap-3 px-6 pb-6">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setShowRevokeModal(false)
+                  setRevokeTarget(null)
+                  setModalError("")
+                }}
+                className="h-10 border border-synod-border px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-synod-muted hover:text-white"
+              >
+                Cancel
+              </Button>
+              <button
+                type="button"
+                onClick={handleRevoke}
+                disabled={actionLoading === revokeTarget.agent_id}
+                className="inline-flex h-10 items-center justify-center rounded-lg bg-red-600 px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:bg-red-500 disabled:opacity-60"
+              >
+                {actionLoading === revokeTarget.agent_id ? "Revoking..." : "Confirm Revoke"}
+              </button>
             </div>
           </div>
-          <div className="text-[8px] bg-red-500/20 text-red-400 px-2 py-1 rounded-md font-black uppercase tracking-widest border border-red-500/30">Offline</div>
         </div>
-      </div>
-    </section>
+      )}
+    </>
   )
 }

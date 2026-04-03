@@ -2,6 +2,7 @@ use synod_coordinator::config::Settings;
 use synod_coordinator::{config, AppState};
 use redis::aio::ConnectionManager;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::Row;
 use std::net::SocketAddr;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -37,9 +38,12 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             },
             stellar: config::StellarConfig {
-                network: "testnet".to_string(),
-                horizon_url: "https://horizon-testnet.stellar.org".to_string(),
-                coordinator_pubkey: String::new(),
+                network: std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string()),
+                network_passphrase: std::env::var("SYNOD_STELLAR__NETWORK_PASSPHRASE")
+                    .unwrap_or_else(|_| "Test SDF Network ; September 2015".to_string()),
+                horizon_url: std::env::var("HORIZON_URL").unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+                coordinator_pubkey: std::env::var("SYNOD_STELLAR__COORDINATOR_PUBKEY").unwrap_or_default(),
+                coordinator_secret_key: std::env::var("SYNOD_STELLAR__COORDINATOR_SECRET_KEY").unwrap_or_default(),
                 coordinator_secret_key_path: String::new(),
             },
             auth: config::AuthConfig {
@@ -59,6 +63,12 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = PgPoolOptions::new()
         .max_connections(settings.database.max_connections)
         .connect(&settings.database.url)
+        .await?;
+
+    // Auto-run migrations
+    info!("Running database migrations...");
+    sqlx::migrate!("./migrations")
+        .run(&db_pool)
         .await?;
 
     // Connect to Redis
@@ -88,6 +98,39 @@ async fn main() -> anyhow::Result<()> {
                 "UPDATE permits SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at < NOW()"
             ).execute(&db_pool_clone).await {
                 tracing::error!("Failed to expire permits: {}", e);
+            }
+        }
+    });
+
+    // Spawn Background Agent Heartbeat Monitor
+    let db_pool_hb = state.db.clone();
+    let tx_events_hb = state.tx_events.clone();
+    tokio::spawn(async move {
+        info!("Agent Heartbeat Monitor started");
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        loop {
+            interval.tick().await;
+            // Flip agents to INACTIVE if no heartbeat for 10 minutes
+            match sqlx::query(
+                "UPDATE agent_slots SET status = 'INACTIVE' WHERE status = 'ACTIVE' AND last_connected < NOW() - INTERVAL '10 minutes' RETURNING agent_id, treasury_id"
+            )
+            .fetch_all(&db_pool_hb)
+            .await {
+                Ok(rows) => {
+                    for row in rows {
+                        let agent_id: uuid::Uuid = row.get("agent_id");
+                        let treasury_id: uuid::Uuid = row.get("treasury_id");
+                        info!(agent = %agent_id, "Agent flipped to INACTIVE (heartbeat timeout)");
+                        let _ = tx_events_hb.send(synod_coordinator::TreasuryEvent::AgentStatusChanged {
+                            treasury_id,
+                            agent_id,
+                            new_status: "INACTIVE".to_string(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to check agent heartbeats: {}", e);
+                }
             }
         }
     });

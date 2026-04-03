@@ -110,7 +110,10 @@ export default function LoginPage() {
             </Button>
           </form>
 
-          <div className="mt-8 pt-6 border-t border-synod-border text-center">
+          <div className="mt-8 pt-6 border-t border-synod-border text-center space-y-4">
+            <p className="text-xs text-muted-foreground">
+              New node operator? <button onClick={() => router.push("/signup")} className="text-synod-accent font-bold hover:underline">PROVISION IDENTITY</button>
+            </p>
             <p className="text-xs text-muted-foreground">
               Node Status: <span className="text-synod-accent font-bold">OPERATIONAL</span>
             </p>

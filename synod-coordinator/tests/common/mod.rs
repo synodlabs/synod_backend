@@ -25,8 +25,10 @@ pub async fn spawn_test_server() -> String {
         },
         stellar: synod_coordinator::config::StellarConfig {
             network: "testnet".to_string(),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
             horizon_url: "https://horizon-testnet.stellar.org".to_string(),
             coordinator_pubkey: "GD...".to_string(),
+            coordinator_secret_key: "".to_string(),
             coordinator_secret_key_path: "".to_string(),
         },
         auth: synod_coordinator::config::AuthConfig {
@@ -46,8 +48,8 @@ pub async fn spawn_test_server() -> String {
         .unwrap();
 
     // Aggressively wipe the schema to resolve migration history issues in tests
-    sqlx::query("DROP SCHEMA public CASCADE").execute(&db_pool).await.unwrap();
-    sqlx::query("CREATE SCHEMA public").execute(&db_pool).await.unwrap();
+    sqlx::query("DROP SCHEMA IF EXISTS public CASCADE").execute(&db_pool).await.unwrap();
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS public").execute(&db_pool).await.unwrap();
 
     // Run migrations so the schema is fresh
     sqlx::migrate!("./migrations")
@@ -99,7 +101,13 @@ pub fn generate_test_stellar_keypair() -> (ed25519_dalek::SigningKey, String) {
 
 pub fn sign_with_key(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) -> String {
     use ed25519_dalek::Signer;
-    let signature = signing_key.sign(message);
+    use sha2::{Sha256, Digest};
+    // Replicate what Freighter does: SHA256("Stellar Signed Message:\n" + message)
+    let mut hasher = Sha256::new();
+    hasher.update(b"Stellar Signed Message:\n");
+    hasher.update(message);
+    let hashed = hasher.finalize();
+    let signature = signing_key.sign(&hashed);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes())
 }
 pub struct TestContext {

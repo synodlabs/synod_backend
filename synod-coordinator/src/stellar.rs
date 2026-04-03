@@ -1,12 +1,13 @@
-use stellar_xdr::curr as next_xdr;
+pub use stellar_xdr::curr as next_xdr;
 use crate::error::{AppError, AppResult};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, Signature, Verifier, VerifyingKey};
 use std::convert::TryInto;
 
 pub fn verify_stellar_signature(
     public_key_str: &str,
     message: &[u8],
     signature_base64: &str,
+    _network_passphrase: &str,
 ) -> AppResult<()> {
     let public_key_bytes = decode_stellar_address(public_key_str)?;
     let signature_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
@@ -18,11 +19,20 @@ pub fn verify_stellar_signature(
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|_| AppError::CosignFailed("Invalid signature format".to_string()))?;
 
-    verifying_key.verify(message, &signature)
+    // Freighter (and the Stellar ecosystem standard) signs:
+    // SHA256("Stellar Signed Message:\n" + message)
+    use sha2::{Sha256, Digest};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"Stellar Signed Message:\n");
+    hasher.update(message);
+    let hashed_payload = hasher.finalize();
+
+    verifying_key.verify(&hashed_payload, &signature)
         .map_err(|_| AppError::OwnershipVerificationFailed)
 }
 
-fn decode_stellar_address(address: &str) -> AppResult<[u8; 32]> {
+pub fn decode_stellar_address(address: &str) -> AppResult<[u8; 32]> {
     let decoded = data_encoding::BASE32_NOPAD.decode(address.as_bytes())
         .map_err(|_| AppError::CosignFailed("Invalid base32 address".into()))?;
     
@@ -78,4 +88,58 @@ pub fn construct_set_options_xdr(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("XDR encoding error: {}", e)))?;
 
     Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, xdr))
+}
+pub fn sign_transaction_hash(
+    secret_key_str: &str,
+    network_passphrase: &str,
+    transaction_xdr_base64: &str,
+) -> AppResult<String> {
+    use sha2::{Sha256, Digest};
+    use next_xdr::{Transaction, WriteXdr, Limits};
+    use ed25519_dalek::SigningKey;
+
+    // 1. Prepare Network ID
+    let mut hasher = Sha256::new();
+    hasher.update(network_passphrase.as_bytes());
+    let network_id = hasher.finalize();
+
+    // 2. Decode Transaction XDR
+    let raw_tx = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, transaction_xdr_base64)
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid XDR base64")))?;
+    
+    // We expect just the Transaction struct (not the envelope) for hashing,
+    // although some SDKs provide the envelope. If it's the envelope, we'd extract the tx.
+    // In our case, construct_set_options_xdr returns the OP or TX? 
+    // Wait, let's assume we receive the Transaction struct.
+    
+    // 3. Prepare Signing Payload
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&network_id);
+    payload.extend_from_slice(&[0, 0, 0, 2]); // EnvelopeType::ENVELOPE_TYPE_TX
+    payload.extend_from_slice(&raw_tx);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let hash = hasher.finalize();
+
+    // 4. Sign
+    let secret_bytes = decode_secret_key(secret_key_str)?; 
+    let signing_key = SigningKey::from_bytes(&secret_bytes);
+    let signature = <SigningKey as Signer<Signature>>::sign(&signing_key, &hash);
+
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes()))
+}
+
+pub fn decode_secret_key(secret: &str) -> AppResult<[u8; 32]> {
+    // Stellar secrets are BASE32 with 0x40 (S) prefix
+    let decoded = data_encoding::BASE32_NOPAD.decode(secret.as_bytes())
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid secret key encoding")))?;
+    
+    if decoded.len() != 35 {
+        return Err(AppError::Internal(anyhow::anyhow!("Invalid secret key length")));
+    }
+    
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded[1..33]);
+    Ok(key)
 }

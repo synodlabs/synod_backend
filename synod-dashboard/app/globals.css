@@ -1,65 +1,85 @@
 @import "tailwindcss";
 
 @theme {
-  --color-synod-bg: #050505;
-  --color-synod-accent: #00ffcc;
-  --color-synod-error: #ff3366;
-  --color-synod-card: rgba(255, 255, 255, 0.05);
-  --color-synod-border: rgba(255, 255, 255, 0.1);
-  --color-synod-hover: rgba(0, 255, 204, 0.1);
+  --color-synod-bg: #000000;
+  --color-synod-card: #09090B;
+  --color-synod-card-hover: #18181B;
+  --color-synod-border: #27272A;
+  --color-synod-border-strong: #3F3F46;
+  --color-synod-accent: #FFFFFF;
+  --color-synod-muted: #A1A1AA;
+  --color-synod-muted-dark: #52525B;
+  
+  --color-synod-success: #FFFFFF;
+  --color-synod-error: #EF4444;
+  --color-synod-warning: #F5A623;
 
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-syne);
+  --font-mono: var(--font-dm-mono);
 
-  --radius-xl: 1rem;
-  --radius-2xl: 1.5rem;
-
-  --animate-pulse-slow: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  --animate-glow: glow 2s ease-in-out infinite alternate;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
 }
 
 @layer base {
   :root {
-    --background: 0 0% 2%;
-    --foreground: 0 0% 98%;
-    --card: 0 0% 4%;
-    --card-foreground: 0 0% 98%;
-    --popover: 0 0% 4%;
-    --popover-foreground: 0 0% 98%;
-    --primary: 168 100% 50%;
-    --primary-foreground: 168 100% 10%;
-    --secondary: 0 0% 10%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 0 0% 10%;
-    --muted-foreground: 0 0% 60%;
-    --accent: 168 100% 50%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 345 100% 60%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 0 0% 15%;
-    --input: 0 0% 15%;
-    --ring: 168 100% 50%;
-    --radius: 0.75rem;
+    --background: 0 0% 0%;
+    --foreground: 0 0% 100%;
+    --card: 240 10% 4%;
+    --card-foreground: 0 0% 100%;
+    --border: 240 5% 15%;
+    --muted: 240 5% 65%;
+    --accent: 0 0% 100%;
   }
 }
 
-@keyframes glow {
-  from { box-shadow: 0 0 10px rgba(0, 255, 204, 0.2); }
-  to { box-shadow: 0 0 20px rgba(0, 255, 204, 0.4); }
-}
-
 body {
-  background-color: #050505;
-  color: #ededed;
+  background-color: var(--color-synod-bg);
+  color: #FFFFFF;
   font-family: var(--font-sans);
   margin: 0;
   -webkit-font-smoothing: antialiased;
 }
 
-.glass-card {
-  @apply bg-synod-card backdrop-blur-xl border border-synod-border rounded-2xl transition-all duration-300;
+/* Base card style matching the HTML reference but B&W */
+.card-base {
+  @apply bg-synod-card border border-synod-border rounded-md transition-all duration-200;
 }
 
-.glass-card:hover {
-  @apply border-synod-accent/30 shadow-[0_0_20px_rgba(0,255,204,0.1)];
+.card-hover:hover {
+  @apply border-synod-border-strong bg-synod-card-hover shadow-lg;
+}
+
+/* Status dots and pills */
+.status-pill {
+  @apply flex items-center gap-2 px-3 py-1 rounded-full font-mono text-[10px] font-bold tracking-widest uppercase border;
+}
+
+.status-pill-healthy {
+  @apply border-white/20 text-white bg-white/5;
+}
+
+.status-pill-error {
+  @apply border-red-500/30 text-red-400 bg-red-500/5;
+}
+
+.status-pill-warning {
+  @apply border-synod-warning/30 text-synod-warning bg-synod-warning/5;
+}
+
+.dot {
+  @apply w-1.5 h-1.5 rounded-full bg-current animate-pulse;
+}
+
+/* Custom Scrollbar matching HTML */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-synod-border-strong rounded-full;
 }

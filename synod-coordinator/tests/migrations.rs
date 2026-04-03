@@ -64,5 +64,4 @@ async fn permits_table_has_indexes(pool: PgPool) {
     let idx_names: Vec<&str> = indexes.iter().map(|i| i.0.as_str()).collect();
     assert!(idx_names.contains(&"idx_permits_agent_status"), "Missing index: idx_permits_agent_status");
     assert!(idx_names.contains(&"idx_permits_treasury_status"), "Missing index: idx_permits_treasury_status");
-    assert!(idx_names.contains(&"idx_permits_wallet_pool"), "Missing index: idx_permits_wallet_pool");
 }

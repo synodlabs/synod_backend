@@ -41,6 +41,24 @@ pub enum AppError {
     #[error("Agent suspended")]
     AgentSuspended,
 
+    #[error("Agent revoked")]
+    AgentRevoked,
+
+    #[error("Pubkey conflict: agent slot already has a different registered keypair")]
+    PubkeyConflict,
+
+    #[error("Signer authorization declined by wallet owner")]
+    SignerAuthDeclined,
+
+    #[error("Wallet session unavailable — user must reconnect wallet via dashboard")]
+    WalletSessionUnavailable,
+
+    #[error("Signer authorization timed out")]
+    SignerAuthTimeout,
+
+    #[error("SetOptions submission failed: {0}")]
+    SetOptionsSubmissionFailed(String),
+
     // Permit errors
     #[error("Permit not found")]
     PermitNotFound,
@@ -99,6 +117,12 @@ impl IntoResponse for AppError {
             AppError::PoolBoundsConflict => (StatusCode::UNPROCESSABLE_ENTITY, "POOL_BOUNDS_CONFLICT"),
             AppError::AgentNotFound => (StatusCode::NOT_FOUND, "AGENT_NOT_FOUND"),
             AppError::AgentSuspended => (StatusCode::FORBIDDEN, "AGENT_SUSPENDED"),
+            AppError::AgentRevoked => (StatusCode::FORBIDDEN, "AGENT_REVOKED"),
+            AppError::PubkeyConflict => (StatusCode::CONFLICT, "PUBKEY_CONFLICT"),
+            AppError::SignerAuthDeclined => (StatusCode::FORBIDDEN, "SIGNER_AUTHORIZATION_DECLINED"),
+            AppError::WalletSessionUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "WALLET_SESSION_UNAVAILABLE"),
+            AppError::SignerAuthTimeout => (StatusCode::REQUEST_TIMEOUT, "SIGNER_AUTHORIZATION_TIMEOUT"),
+            AppError::SetOptionsSubmissionFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "SETOPTIONS_SUBMISSION_FAILED"),
             AppError::PermitNotFound => (StatusCode::NOT_FOUND, "PERMIT_NOT_FOUND"),
             AppError::PermitExpired => (StatusCode::GONE, "PERMIT_EXPIRED"),
             AppError::CosignFailed(_) => (StatusCode::BAD_REQUEST, "COSIGN_FAILED"),

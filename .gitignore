@@ -9,6 +9,13 @@ node_modules/
 dist/
 .env
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
 # MacOS & Windows
 .DS_Store
 Thumbs.db
@@ -30,3 +37,13 @@ __synod_doc_extract.txt
 *.key
 !config/default.toml
 !tests/fixtures/
+
+# Local analysis notes
+LOCAL_ARCHITECTURE_REVIEW.md
+
+# Local tooling and generated artifacts
+.kiro/
+synod-coordinator/check_errors.txt
+synod-coordinator/check_errors_utf8.txt
+synod-coordinator/generator_output.txt
+synod-coordinator/tmp/

@@ -40,17 +40,7 @@ async fn test_phase_9_halt_and_resume() {
         "treasury_id": treasury_id,
         "version": 1,
         "max_drawdown_pct": 15.0,
-        "pools": [
-            {
-                "pool_key": "pool:XLM",
-                "wallet_address": "GA5WNX...",
-                "asset_code": "XLM",
-                "target_pct": 100.0,
-                "ceiling_pct": 150.0,
-                "floor_pct": 20.0,
-                "drift_threshold_pct": 5.0
-            }
-        ],
+        "agent_allocations": [],
         "inflow_routing": [],
         "governance_mode": "AUTO"
     }))
@@ -76,7 +66,6 @@ async fn test_phase_9_halt_and_resume() {
             agent_id: Uuid::parse_str(agent_id).unwrap(),
             treasury_id: treasury_uuid,
             wallet_address: "GA5WNX...".to_string(),
-            pool_key: "pool:XLM".to_string(),
             asset_code: "XLM".to_string(),
             asset_issuer: None,
             requested_amount: BigDecimal::from(500),
@@ -112,7 +101,6 @@ async fn test_phase_9_halt_and_resume() {
             agent_id: Uuid::parse_str(agent_id).unwrap(),
             treasury_id: treasury_uuid,
             wallet_address: "GA5WNX...".to_string(),
-            pool_key: "pool:XLM".to_string(),
             asset_code: "XLM".to_string(),
             asset_issuer: None,
             requested_amount: BigDecimal::from(100),
@@ -144,7 +132,6 @@ async fn test_phase_9_halt_and_resume() {
             agent_id: Uuid::parse_str(agent_id).unwrap(),
             treasury_id: treasury_uuid,
             wallet_address: "GA5WNX...".to_string(),
-            pool_key: "pool:XLM".to_string(),
             asset_code: "XLM".to_string(),
             asset_issuer: None,
             requested_amount: BigDecimal::from(100),

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 mod common;
 use common::{spawn_test_server, generate_test_stellar_keypair, sign_with_key};
-use synod_coordinator::constitution::{PoolConfig, ConstitutionContent};
+use synod_coordinator::constitution::{AgentWalletRule, ConstitutionContent, TreasuryRules};
 
 #[tokio::test]
 async fn test_phase_5_constitution_flow() {
@@ -35,22 +35,24 @@ async fn test_phase_5_constitution_flow() {
     // 2. Test Constitution Creation (Admin Override flow used in CRUD)
     let valid_constitution = json!({
         "content": {
-            "pools": [
+            "treasury_rules": {
+                "max_drawdown_pct": 15.0,
+                "max_concurrent_permits": 10
+            },
+            "agent_wallet_rules": [
                 {
-                    "pool_key": "reserves_pool",
-                    "asset_code": "USDC",
-                    "target_pct": 50.0,
-                    "floor_pct": 40.0,
-                    "ceiling_pct": 60.0,
-                    "drift_bounds_pct": 2.0
+                    "agent_id": Uuid::new_v4(),
+                    "wallet_address": "USDC_wallet",
+                    "allocation_pct": 50.0,
+                    "tier_limit_usd": 5000.0,
+                    "concurrent_permit_cap": 3
                 },
                 {
-                    "pool_key": "growth_pool",
-                    "asset_code": "XLM",
-                    "target_pct": 50.0,
-                    "floor_pct": 30.0,
-                    "ceiling_pct": 70.0,
-                    "drift_bounds_pct": 5.0
+                    "agent_id": Uuid::new_v4(),
+                    "wallet_address": "USDC_wallet",
+                    "allocation_pct": 50.0,
+                    "tier_limit_usd": 2500.0,
+                    "concurrent_permit_cap": 2
                 }
             ]
         }
@@ -69,22 +71,24 @@ async fn test_phase_5_constitution_flow() {
     // 3. Test Invalid Constitution (Math failure)
     let invalid_constitution = json!({
         "content": {
-            "pools": [
+            "treasury_rules": {
+                "max_drawdown_pct": 15.0,
+                "max_concurrent_permits": 10
+            },
+            "agent_wallet_rules": [
                 {
-                    "pool_key": "reserves_pool",
-                    "asset_code": "USDC",
-                    "target_pct": 90.0, // Sum = 140.0
-                    "floor_pct": 40.0,
-                    "ceiling_pct": 100.0,
-                    "drift_bounds_pct": 2.0
+                    "agent_id": Uuid::new_v4(),
+                    "wallet_address": "USDC_wallet",
+                    "allocation_pct": 90.0,
+                    "tier_limit_usd": 5000.0,
+                    "concurrent_permit_cap": 3
                 },
                 {
-                    "pool_key": "growth_pool",
-                    "asset_code": "XLM",
-                    "target_pct": 50.0,
-                    "floor_pct": 30.0,
-                    "ceiling_pct": 70.0,
-                    "drift_bounds_pct": 5.0
+                    "agent_id": Uuid::new_v4(),
+                    "wallet_address": "USDC_wallet",
+                    "allocation_pct": 50.0,
+                    "tier_limit_usd": 2500.0,
+                    "concurrent_permit_cap": 2
                 }
             ]
         }
@@ -100,14 +104,17 @@ async fn test_phase_5_constitution_flow() {
     // 4. Test Proposal Creation
     let proposal_req = json!({
         "content": {
-            "pools": [
+            "treasury_rules": {
+                "max_drawdown_pct": 15.0,
+                "max_concurrent_permits": 10
+            },
+            "agent_wallet_rules": [
                  {
-                    "pool_key": "single_asset",
-                    "asset_code": "USDC",
-                    "target_pct": 100.0,
-                    "floor_pct": 80.0,
-                    "ceiling_pct": 110.0,
-                    "drift_bounds_pct": 5.0
+                    "agent_id": Uuid::new_v4(),
+                    "wallet_address": "XLM_wallet",
+                    "allocation_pct": 100.0,
+                    "tier_limit_usd": 1000.0,
+                    "concurrent_permit_cap": 1
                 }
             ]
         }
@@ -183,14 +190,17 @@ async fn test_phase_5_governance_signing() {
 
     // 3. Create a Version 1 Constitution (Base)
     let v1_content = json!({
-        "pools": [
+        "treasury_rules": {
+            "max_drawdown_pct": 15.0,
+            "max_concurrent_permits": 10
+        },
+        "agent_wallet_rules": [
             {
-                "pool_key": "main",
-                "asset_code": "USDC",
-                "target_pct": 100.0,
-                "floor_pct": 80.0,
-                "ceiling_pct": 110.0,
-                "drift_bounds_pct": 5.0
+                "agent_id": Uuid::new_v4(),
+                "wallet_address": "STELLAR_CORE",
+                "allocation_pct": 100.0,
+                "tier_limit_usd": 1000.0,
+                "concurrent_permit_cap": 1
             }
         ]
     });
@@ -202,14 +212,17 @@ async fn test_phase_5_governance_signing() {
     // 4. Propose a Change (Version 2)
     let v2_content = ConstitutionContent {
         memo: Some("test change".to_string()),
-        pools: vec![
-            PoolConfig {
-                pool_key: "main".to_string(),
-                asset_code: "USDC".to_string(),
-                target_pct: 100.0,
-                floor_pct: 80.0,
-                ceiling_pct: 115.0,
-                drift_bounds_pct: 5.0,
+        treasury_rules: TreasuryRules {
+            max_drawdown_pct: 15.0,
+            max_concurrent_permits: 10,
+        },
+        agent_wallet_rules: vec![
+            AgentWalletRule {
+                agent_id: Uuid::new_v4(),
+                wallet_address: "STELLAR_CORE".to_string(),
+                allocation_pct: 100.0,
+                tier_limit_usd: 2500.0,
+                concurrent_permit_cap: 2,
             }
         ],
     };
@@ -250,8 +263,9 @@ async fn test_phase_5_governance_signing() {
         .send().await.unwrap();
     let history: Vec<serde_json::Value> = history_res.json().await.unwrap();
     
-    // History should have [v2, v1] (ordered by version DESC)
-    assert_eq!(history.len(), 2);
+    // History should have [v2, v1, v0] (ordered by version DESC)
+    assert_eq!(history.len(), 3);
     assert_eq!(history[0]["version"].as_i64().unwrap(), 2);
     assert_eq!(history[1]["version"].as_i64().unwrap(), 1);
+    assert_eq!(history[2]["version"].as_i64().unwrap(), 0);
 }

@@ -9,7 +9,8 @@ use sqlx::Row;
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::auth::AuthUser;
+use crate::auth::AgentAuth;
+use crate::constitution::{normalize_constitution_value, AgentWalletRule as CoordinatorAgentWalletRule};
 use crate::policy::run_policy_engine;
 use synod_shared::models::*;
 
@@ -19,6 +20,13 @@ pub struct PermitGroupRequest {
     pub treasury_id: Uuid,
     pub legs: Vec<PermitRequest>,
     pub require_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermitDecisionResponse {
+    pub permit_id: Uuid,
+    #[serde(flatten)]
+    pub result: PolicyResult,
 }
 
 pub fn router() -> Router<AppState> {
@@ -31,10 +39,13 @@ pub fn router() -> Router<AppState> {
 
 pub async fn request_permit(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    agent_auth: AgentAuth,
     Json(payload): Json<PermitRequest>,
-) -> AppResult<(StatusCode, Json<PolicyResult>)> {
+) -> AppResult<(StatusCode, Json<PermitDecisionResponse>)> {
     info!("Handling permit request for agent: {}", payload.agent_id);
+    if payload.agent_id != agent_auth.agent_id || payload.treasury_id != agent_auth.treasury_id {
+        return Err(AppError::InvalidApiKey);
+    }
     let mut tx = state.db.begin().await?;
     
     let group_id = Uuid::new_v4();
@@ -52,7 +63,7 @@ pub async fn request_permit(
     .bind(Utc::now() + Duration::hours(1))
     .execute(&mut *tx).await?;
 
-    let (result, _permit_id) = process_single_permit(&mut tx, &state, &payload, group_id, Uuid::new_v4()).await?;
+    let (result, permit_id) = process_single_permit(&mut tx, &state, &payload, group_id, Uuid::new_v4()).await?;
     
     // Update group status if approved/denied immediately
     let group_status = if result.approved { "ACTIVE" } else { "DENIED" };
@@ -64,14 +75,17 @@ pub async fn request_permit(
 
     tx.commit().await?;
     let status_code = if result.approved { StatusCode::CREATED } else { StatusCode::OK };
-    Ok((status_code, Json(result)))
+    Ok((status_code, Json(PermitDecisionResponse { permit_id, result })))
 }
 
 pub async fn request_permit_group(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    agent_auth: AgentAuth,
     Json(payload): Json<PermitGroupRequest>,
 ) -> AppResult<(StatusCode, Json<Vec<PolicyResult>>)> {
+    if payload.agent_id != agent_auth.agent_id || payload.treasury_id != agent_auth.treasury_id {
+        return Err(AppError::InvalidApiKey);
+    }
     let mut tx = state.db.begin().await?;
     let group_id = Uuid::new_v4();
     let mut results = Vec::new();
@@ -138,17 +152,21 @@ pub struct CosignRequest {
 
 pub async fn cosign_permit(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    agent_auth: AgentAuth,
     Path(permit_id): Path<Uuid>,
     Json(payload): Json<CosignRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     // 1. Fetch Permit
     let permit = sqlx::query(
-        "SELECT wallet_address, asset_code, approved_amount::float8 FROM permits WHERE permit_id = $1 AND status = 'ACTIVE'"
+        "SELECT agent_id, wallet_address, asset_code, approved_amount::float8 FROM permits WHERE permit_id = $1 AND status = 'ACTIVE'"
     )
     .bind(permit_id)
     .fetch_optional(&state.db).await?
     .ok_or(AppError::NotFound("Active permit not found".into()))?;
+
+    if permit.get::<Uuid, _>("agent_id") != agent_auth.agent_id {
+        return Err(AppError::InvalidApiKey);
+    }
 
     // 2. Verify Intent (Destination, Amount, Asset)
     // Simplified verification for the test gate:
@@ -185,7 +203,7 @@ pub struct OutcomeReport {
 
 pub async fn report_outcome(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    agent_auth: AgentAuth,
     Path(permit_id): Path<Uuid>,
     Json(payload): Json<OutcomeReport>,
 ) -> AppResult<StatusCode> {
@@ -193,7 +211,7 @@ pub async fn report_outcome(
 
     // 1. Fetch info for drawdown check
     let treasury_info = sqlx::query(
-        "SELECT t.treasury_id, t.peak_aum_usd::float8, t.current_aum_usd::float8, (c.content->>'max_drawdown_pct')::float8 as max_drawdown_pct
+        "SELECT t.treasury_id, p.agent_id, t.peak_aum_usd::float8, t.current_aum_usd::float8, c.content
          FROM treasuries t
          JOIN permits p ON p.treasury_id = t.treasury_id
          JOIN constitution_history c ON c.treasury_id = t.treasury_id AND c.version = t.constitution_version
@@ -203,9 +221,15 @@ pub async fn report_outcome(
     .fetch_one(&mut *tx).await?;
 
     let treasury_id: Uuid = treasury_info.get("treasury_id");
+    let permit_agent_id: Uuid = treasury_info.get("agent_id");
+    if permit_agent_id != agent_auth.agent_id {
+        return Err(AppError::InvalidApiKey);
+    }
     let peak_aum: f64 = treasury_info.get("peak_aum_usd");
     let current_aum: f64 = treasury_info.get("current_aum_usd");
-    let max_drawdown: f64 = treasury_info.get("max_drawdown_pct");
+    let content_json: serde_json::Value = treasury_info.get("content");
+    let constitution = normalize_constitution_value(content_json)?;
+    let max_drawdown = constitution.treasury_rules.max_drawdown_pct;
     let pnl: f64 = payload.pnl_usd.to_string().parse::<f64>().unwrap_or(0.0);
 
     let new_aum = current_aum + pnl;
@@ -226,17 +250,60 @@ pub async fn report_outcome(
         .execute(&mut *tx).await?;
 
     // 4. Check Drawdown Trigger
+    let mut triggered_halt = false;
     if peak_aum > 0.0 {
         let drawdown_pct = (peak_aum - new_aum) / peak_aum * 100.0;
         if drawdown_pct >= max_drawdown {
             info!("CRITICAL: Drawdown threshold reached ({:.2}%) for treasury {}. Triggering Halt.", drawdown_pct, treasury_id);
             crate::treasury::apply_halt(&mut tx, treasury_id).await?;
+            triggered_halt = true;
         }
     }
 
     tx.commit().await?;
+    if triggered_halt {
+        let _ = state.tx_events.send(crate::TreasuryEvent::TreasuryHalted { treasury_id });
+    }
     info!("Outcome reported for permit {}: PnL {}", permit_id, payload.pnl_usd);
     Ok(StatusCode::OK)
+}
+
+fn build_access_from_rule(rule: &CoordinatorAgentWalletRule, can_execute: bool) -> AgentWalletAccess {
+    AgentWalletAccess {
+        agent_id: rule.agent_id,
+        wallet_address: rule.wallet_address.clone(),
+        allocation_pct: BigDecimal::try_from(rule.allocation_pct).unwrap_or(BigDecimal::from(100)),
+        tier_limit_usd: BigDecimal::try_from(rule.tier_limit_usd).unwrap_or_default(),
+        concurrent_permit_cap: rule.concurrent_permit_cap,
+        can_execute,
+    }
+}
+
+fn build_shared_constitution(
+    treasury_id: Uuid,
+    version: i32,
+    content: &crate::constitution::ConstitutionContent,
+) -> Constitution {
+    Constitution {
+        treasury_id,
+        version,
+        memo: content.memo.clone(),
+        treasury_rules: TreasuryRules {
+            max_drawdown_pct: BigDecimal::try_from(content.treasury_rules.max_drawdown_pct).unwrap_or(BigDecimal::from(15)),
+            max_concurrent_permits: content.treasury_rules.max_concurrent_permits,
+        },
+        agent_wallet_rules: content
+            .agent_wallet_rules
+            .iter()
+            .map(|rule| AgentWalletRule {
+                agent_id: rule.agent_id,
+                wallet_address: rule.wallet_address.clone(),
+                allocation_pct: BigDecimal::try_from(rule.allocation_pct).unwrap_or(BigDecimal::from(100)),
+                tier_limit_usd: BigDecimal::try_from(rule.tier_limit_usd).unwrap_or_default(),
+                concurrent_permit_cap: rule.concurrent_permit_cap,
+            })
+            .collect(),
+    }
 }
 
 async fn process_single_permit(
@@ -246,33 +313,29 @@ async fn process_single_permit(
     group_id: Uuid,
     leg_id: Uuid,
 ) -> AppResult<(PolicyResult, Uuid)> {
-    // a. Agent Access
-    let agent_access = match sqlx::query(
-        r#"SELECT agent_id, wallet_address, '{}'::text[] as pools,
-           tier_limit_usd::float8, concurrent_permit_cap, (status = 'ACTIVE') as can_execute
-           FROM agent_slots WHERE agent_id = $1"#
+    // a. Agent slot status
+    let agent_slot = match sqlx::query(
+        "SELECT status FROM agent_slots WHERE agent_id = $1 AND treasury_id = $2"
     )
     .bind(payload.agent_id)
+    .bind(payload.treasury_id)
     .fetch_optional(&mut **tx).await? {
-        Some(row) => {
-            AgentWalletAccess {
-                agent_id: row.get("agent_id"),
-                wallet_address: row.get::<Option<String>, _>("wallet_address").unwrap_or_default(),
-                pools: vec![payload.pool_key.clone()], // TEMPORARY: allow requested pool
-                tier_limit_usd: BigDecimal::try_from(row.get::<f64, _>("tier_limit_usd")).unwrap_or_default(),
-                concurrent_permit_cap: row.get("concurrent_permit_cap"),
-                can_execute: row.get("can_execute"),
-            }
-        },
+        Some(row) => row,
         None => {
-            tracing::error!("Agent {} not found or access denied", payload.agent_id);
-            return Err(AppError::InvalidInput("Agent not found".into()));
+            tracing::error!("Agent {} not found", payload.agent_id);
+            return Err(AppError::AgentNotFound);
         }
     };
 
-    // b. Treasury Info
+    let agent_status: String = agent_slot.get("status");
+    let can_execute = agent_status == "ACTIVE";
+
+    // b. Treasury Info + normalized constitution
     let treasury_info = match sqlx::query(
-        "SELECT health, peak_aum_usd::float8, current_aum_usd::float8, constitution_version FROM treasuries WHERE treasury_id = $1"
+        "SELECT t.health, t.peak_aum_usd::float8, t.current_aum_usd::float8, t.constitution_version, c.content
+         FROM treasuries t
+         JOIN constitution_history c ON c.treasury_id = t.treasury_id AND c.version = t.constitution_version
+         WHERE t.treasury_id = $1"
     )
     .bind(payload.treasury_id)
     .fetch_optional(&mut **tx).await? {
@@ -283,52 +346,36 @@ async fn process_single_permit(
         }
     };
 
-    // c. Pool Info (Integrated from Constitution)
-    let pool_row = match sqlx::query(
-        r#"SELECT p.pool_key, p.wallet_address, p.asset_code, 
-           p.target_pct::float8, p.ceiling_pct::float8, p.floor_pct::float8, p.drift_threshold_pct::float8
-           FROM constitution_history ch, jsonb_to_recordset(ch.content->'pools') as p(
-                pool_key text, wallet_address text, asset_code text, target_pct numeric, ceiling_pct numeric, floor_pct numeric, drift_threshold_pct numeric
-           ) WHERE ch.treasury_id = $1 AND ch.version = $2 AND p.pool_key = $3"#
-    )
-    .bind(payload.treasury_id)
-    .bind(treasury_info.get::<i32, _>("constitution_version"))
-    .bind(&payload.pool_key)
-    .fetch_optional(&mut **tx).await? {
-        Some(r) => r,
-        None => {
-            tracing::error!("Pool {} not found in treasury {} version {}", payload.pool_key, payload.treasury_id, treasury_info.get::<i32, _>("constitution_version"));
-            return Err(AppError::InvalidInput("Pool not found".into()));
-        }
-    };
+    let constitution_content = normalize_constitution_value(treasury_info.get("content"))?;
+    let wallet_rule = constitution_content
+        .agent_wallet_rules
+        .iter()
+        .find(|rule| rule.agent_id == payload.agent_id && rule.wallet_address == payload.wallet_address)
+        .cloned()
+        .ok_or_else(|| AppError::InvalidInput("Wallet not assigned to this agent".into()))?;
+    let agent_access = build_access_from_rule(&wallet_rule, can_execute);
 
-    // d. Reservations & Stats
+    // d. Agent's Active Reservations & Stats
     let total_active_res_f64: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(approved_amount), 0)::float8 FROM permits WHERE pool_key = $1 AND status = 'ACTIVE'"
+        "SELECT COALESCE(SUM(approved_amount), 0)::float8 FROM permits WHERE agent_id = $1 AND wallet_address = $2 AND status = 'ACTIVE'"
     )
-    .bind(&payload.pool_key)
+    .bind(payload.agent_id)
+    .bind(&payload.wallet_address)
     .fetch_one(&mut **tx).await?;
     let total_active_res = total_active_res_f64.to_string().parse::<BigDecimal>().unwrap_or_default();
 
     let active_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM permits WHERE agent_id = $1 AND status = 'ACTIVE'"
+        "SELECT COUNT(*) FROM permits WHERE agent_id = $1 AND wallet_address = $2 AND status = 'ACTIVE'"
     )
     .bind(payload.agent_id)
+    .bind(&payload.wallet_address)
     .fetch_one(&mut **tx).await?;
 
-    // e. Build State for Policy
-    let pool_state = PoolState {
-        pool_key: pool_row.get::<Option<String>, _>("pool_key").unwrap_or_default(),
-        wallet_address: pool_row.get::<Option<String>, _>("wallet_address").unwrap_or_default(),
-        asset_code: pool_row.get::<Option<String>, _>("asset_code").unwrap_or_default(),
-        balance_units: BigDecimal::from(0),
-        balance_usd: BigDecimal::from(5000), // MOCK: should be from Redis
-        target_pct: pool_row.get::<f64, _>("target_pct").to_string().parse::<BigDecimal>().unwrap_or_default(),
-        ceiling_pct: pool_row.get::<f64, _>("ceiling_pct").to_string().parse::<BigDecimal>().unwrap_or_default(),
-        floor_pct: pool_row.get::<f64, _>("floor_pct").to_string().parse::<BigDecimal>().unwrap_or_default(),
-        drift_threshold_pct: pool_row.get::<f64, _>("drift_threshold_pct").to_string().parse::<BigDecimal>().unwrap_or_default(),
-        locked: false,
-    };
+    let treasury_active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM permits WHERE treasury_id = $1 AND status = 'ACTIVE'"
+    )
+    .bind(payload.treasury_id)
+    .fetch_one(&mut **tx).await?;
 
     let health_str = treasury_info.get::<String, _>("health");
     let health = if health_str == "HALTED" { TreasuryHealth::Halted } else { TreasuryHealth::Healthy };
@@ -339,29 +386,33 @@ async fn process_single_permit(
         peak_aum_usd: treasury_info.get::<f64, _>("peak_aum_usd").to_string().parse::<BigDecimal>().unwrap_or_default(),
         current_aum_usd: treasury_info.get::<f64, _>("current_aum_usd").to_string().parse::<BigDecimal>().unwrap_or_default(),
         state_hash: "state_hash".into(),
-        pools: vec![pool_state],
     };
 
-    let constitution = Constitution {
-        treasury_id: payload.treasury_id,
-        version: treasury_info.get("constitution_version"),
-        pools: vec![],
-        max_drawdown_pct: BigDecimal::from(15),
-        inflow_routing: vec![],
-        governance_mode: "AUTO".into(),
-    };
+    let constitution = build_shared_constitution(
+        payload.treasury_id,
+        treasury_info.get::<i32, _>("constitution_version"),
+        &constitution_content,
+    );
 
     // f. Run Engine
-    let result = run_policy_engine(payload, &treasury_state, &agent_access, &constitution, &total_active_res, active_count as i32);
+    let result = run_policy_engine(
+        payload,
+        &treasury_state,
+        &agent_access,
+        &constitution,
+        &total_active_res,
+        active_count as i32,
+        treasury_active_count as i32,
+    );
 
     // g. Persist
     let permit_id = Uuid::new_v4();
     let status = if result.approved { "ACTIVE" } else { "DENIED" };
     
     sqlx::query(
-        r#"INSERT INTO permits (permit_id, group_id, leg_id, agent_id, treasury_id, wallet_address, pool_key, asset_code, 
+        r#"INSERT INTO permits (permit_id, group_id, leg_id, agent_id, treasury_id, wallet_address, asset_code, 
            requested_amount, approved_amount, status, deny_reason, policy_check_number, state_snapshot_hash, coordinator_sig, expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"#
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"#
     )
     .bind(permit_id)
     .bind(group_id)
@@ -369,7 +420,6 @@ async fn process_single_permit(
     .bind(payload.agent_id)
     .bind(payload.treasury_id)
     .bind(payload.wallet_address.clone())
-    .bind(payload.pool_key.clone())
     .bind(payload.asset_code.clone())
     .bind(payload.requested_amount.to_string().parse::<f64>().unwrap_or(0.0))
     .bind(result.approved_amount.to_string().parse::<f64>().unwrap_or(0.0))

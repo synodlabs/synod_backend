@@ -11,6 +11,7 @@ pub fn run_policy_engine(
     constitution: &Constitution,
     total_active_reservations_usd: &BigDecimal,
     active_count: i32,
+    treasury_active_count: i32,
 ) -> PolicyResult {
     // Start with requested amount as the baseline for approval
     let mut current_approved = request.requested_amount.clone();
@@ -31,60 +32,39 @@ pub fn run_policy_engine(
         return deny(reason, 3);
     }
 
-    // Rule 4: Pool Access
-    if let Err(reason) = check_pool_access(request, agent_access) {
-        return deny(reason, 4);
+    // Rule 4: Agent Allocation (Supports Partial)
+    match check_agent_allocation(request, agent_access, total_active_reservations_usd, &treasury_state.current_aum_usd) {
+        Ok(limit) if limit < current_approved => {
+            current_approved = limit;
+            partial_reason = Some("AGENT_ALLOCATION_REACHED".to_string());
+        }
+        Ok(_) => {}
+        Err(reason) => return deny(reason, 4),
     }
 
-    // Rule 5: Pool Locked
-    if let Err(reason) = check_pool_locked(request, treasury_state) {
-        return deny(reason, 5);
-    }
-
-    // Rule 6: Tier Limit (Supports Partial)
+    // Rule 5: Tier Limit (Supports Partial)
     match check_tier_limit(request, agent_access) {
         Ok(limit) if limit < current_approved => {
             current_approved = limit;
             partial_reason = Some("TIER_LIMIT_EXCEEDED".to_string());
         }
         Ok(_) => {}
-        Err(reason) => return deny(reason, 6),
+        Err(reason) => return deny(reason, 5),
     }
 
-    // Rule 7: Concurrent Limit
+    // Rule 6: Concurrent Limit
     if let Err(reason) = check_concurrent_limit(active_count, agent_access) {
+        return deny(reason, 6);
+    }
+
+    // Rule 7: Treasury Concurrent Limit
+    if let Err(reason) = check_treasury_concurrent_limit(treasury_active_count, constitution) {
         return deny(reason, 7);
     }
 
-    // Get Pool State for bound checks
-    let pool_state = match treasury_state.pools.iter().find(|p| p.pool_key == request.pool_key) {
-        Some(p) => p,
-        None => return deny("POOL_NOT_FOUND_IN_STATE".to_string(), 0),
-    };
-
-    // Rule 8: Pool Ceiling (Supports Partial)
-    match check_pool_ceiling(request, pool_state, total_active_reservations_usd, &treasury_state.current_aum_usd) {
-        Ok(limit) if limit < current_approved => {
-            current_approved = limit;
-            partial_reason = Some("POOL_CEILING_REACHED".to_string());
-        }
-        Ok(_) => {}
-        Err(reason) => return deny(reason, 8),
-    }
-
-    // Rule 9: Pool Floor (Supports Partial)
-    match check_pool_floor(request, pool_state, total_active_reservations_usd, &treasury_state.current_aum_usd) {
-        Ok(limit) if limit < current_approved => {
-            current_approved = limit;
-            partial_reason = Some("POOL_FLOOR_VIOLATION".to_string());
-        }
-        Ok(_) => {}
-        Err(reason) => return deny(reason, 9),
-    }
-
-    // Rule 10: Drawdown Limit
+    // Rule 8: Drawdown Limit
     if let Err(reason) = check_drawdown_limit(treasury_state, constitution) {
-        return deny(reason, 10);
+        return deny(reason, 8);
     }
 
     // Final Approval

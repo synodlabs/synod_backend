@@ -34,6 +34,8 @@ pub async fn create_treasury(
 ) -> AppResult<Json<TreasuryResponse>> {
     let treasury_id = Uuid::new_v4();
     
+    let mut tx = state.db.begin().await?;
+
     sqlx::query(
         "INSERT INTO treasuries (treasury_id, owner_user_id, name, network, health, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'PENDING_WALLET', $5, $5)"
@@ -43,8 +45,30 @@ pub async fn create_treasury(
     .bind(&payload.name)
     .bind(&payload.network)
     .bind(Utc::now())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+
+    // Initial Constitution (No agent access yet, policy-first shape)
+    let initial_content = serde_json::json!({
+        "memo": "Genesis Constitution",
+        "treasury_rules": {
+            "max_drawdown_pct": 15.0,
+            "max_concurrent_permits": 10
+        },
+        "agent_wallet_rules": []
+    });
+
+    sqlx::query(
+        "INSERT INTO constitution_history (version, treasury_id, state_hash, content, executed_at)
+         VALUES (0, $1, 'genesis', $2, $3)"
+    )
+    .bind(treasury_id)
+    .bind(initial_content)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
 
     Ok(Json(TreasuryResponse {
         treasury_id,
@@ -77,7 +101,8 @@ pub async fn register_wallet(
 
     sqlx::query(
         "INSERT INTO treasury_wallets (wallet_id, treasury_id, wallet_address, label, multisig_active, status, added_at)
-         VALUES ($1, $2, $3, $4, false, 'PENDING', $5)"
+         VALUES ($1, $2, $3, $4, false, 'PENDING', $5)
+         ON CONFLICT (treasury_id, wallet_address) DO NOTHING"
     )
     .bind(Uuid::new_v4())
     .bind(treasury_id)
@@ -87,7 +112,7 @@ pub async fn register_wallet(
     .execute(&state.db)
     .await?;
 
-    Ok(StatusCode::CREATED)
+    Ok(StatusCode::OK)
 }
 
 pub async fn apply_halt(
@@ -145,13 +170,42 @@ pub async fn resume_treasury(
     .execute(&mut *tx).await?;
 
     tx.commit().await?;
+    let _ = state.tx_events.send(crate::TreasuryEvent::TreasuryResumed { treasury_id });
 
     Ok(StatusCode::OK)
+}
+
+pub async fn remove_wallet(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((treasury_id, wallet_address)): Path<(Uuid, String)>,
+) -> AppResult<StatusCode> {
+    // 1. Verify Ownership
+    let is_owner: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)")
+        .bind(treasury_id)
+        .bind(auth.user_id)
+        .fetch_one(&state.db)
+        .await?
+        .get(0);
+
+    if !is_owner {
+        return Err(AppError::TreasuryNotFound);
+    }
+
+    // 2. Delete Wallet entry
+    sqlx::query("DELETE FROM treasury_wallets WHERE treasury_id = $1 AND wallet_address = $2")
+        .bind(treasury_id)
+        .bind(wallet_address)
+        .execute(&state.db)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(create_treasury))
         .route("/:id/wallets", post(register_wallet))
+        .route("/:id/wallets/:address", post(remove_wallet)) // Note: using post for consistency if needed, but DELETE is better
         .route("/:id/resume", post(resume_treasury))
 }

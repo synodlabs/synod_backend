@@ -102,7 +102,6 @@ pub struct PermitRequest {
     pub agent_id: Uuid,
     pub treasury_id: Uuid,
     pub wallet_address: String,
-    pub pool_key: String,
     pub asset_code: String,
     pub asset_issuer: Option<String>,
     pub requested_amount: BigDecimal,
@@ -128,22 +127,9 @@ pub struct TreasuryState {
     pub peak_aum_usd: BigDecimal,
     pub current_aum_usd: BigDecimal,
     pub state_hash: String,
-    pub pools: Vec<PoolState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolState {
-    pub pool_key: String,
-    pub wallet_address: String,
-    pub asset_code: String,
-    pub balance_units: BigDecimal,
-    pub balance_usd: BigDecimal,
-    pub target_pct: BigDecimal,
-    pub ceiling_pct: BigDecimal,
-    pub floor_pct: BigDecimal,
-    pub drift_threshold_pct: BigDecimal,
-    pub locked: bool,
-}
+
 
 // ── Constitution ──
 
@@ -151,30 +137,34 @@ pub struct PoolState {
 pub struct Constitution {
     pub treasury_id: Uuid,
     pub version: i32,
-    pub pools: Vec<PoolDefinition>,
+    pub memo: Option<String>,
+    pub treasury_rules: TreasuryRules,
+    pub agent_wallet_rules: Vec<AgentWalletRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstitutionContent {
+    pub memo: Option<String>,
+    pub treasury_rules: TreasuryRules,
+    pub agent_wallet_rules: Vec<AgentWalletRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreasuryRules {
     pub max_drawdown_pct: BigDecimal,
-    pub inflow_routing: Vec<InflowRule>,
-    pub governance_mode: String,
+    pub max_concurrent_permits: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolDefinition {
-    pub pool_key: String,
+pub struct AgentWalletRule {
+    pub agent_id: Uuid,
     pub wallet_address: String,
-    pub asset_code: String,
-    pub target_pct: BigDecimal,
-    pub ceiling_pct: BigDecimal,
-    pub floor_pct: BigDecimal,
-    pub drift_threshold_pct: BigDecimal,
+    pub allocation_pct: BigDecimal,
+    pub tier_limit_usd: BigDecimal,
+    pub concurrent_permit_cap: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InflowRule {
-    pub priority: i32,
-    pub match_type: String,
-    pub match_value: String,
-    pub target_pool_key: String,
-}
+
 
 // ── Agent Wallet Access (input to policy engine) ──
 
@@ -182,7 +172,7 @@ pub struct InflowRule {
 pub struct AgentWalletAccess {
     pub agent_id: Uuid,
     pub wallet_address: String,
-    pub pools: Vec<String>,
+    pub allocation_pct: BigDecimal,
     pub tier_limit_usd: BigDecimal,
     pub concurrent_permit_cap: i32,
     pub can_execute: bool,

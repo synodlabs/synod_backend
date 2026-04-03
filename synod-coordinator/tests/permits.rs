@@ -33,17 +33,7 @@ async fn test_permit_full_lifecycle() {
         .header("Authorization", &auth_header)
         .json(&serde_json::json!({
             "content": {
-                "pools": [
-                    {
-                        "pool_key": "pool:XLM",
-                        "wallet_address": "GA5WNX...",
-                        "asset_code": "XLM",
-                        "target_pct": 100.0,
-                        "ceiling_pct": 150.0,
-                        "floor_pct": 20.0,
-                        "drift_threshold_pct": 5.0
-                    }
-                ]
+                "agent_allocations": []
             }
         }))
         .send().await.unwrap();
@@ -72,7 +62,6 @@ async fn test_permit_full_lifecycle() {
         agent_id: Uuid::parse_str(agent_id).unwrap(),
         treasury_id: Uuid::parse_str(treasury_id).unwrap(),
         wallet_address: "GA5WNX...".to_string(),
-        pool_key: "pool:XLM".to_string(),
         asset_code: "XLM".to_string(),
         asset_issuer: None,
         requested_amount: BigDecimal::from(500),
@@ -138,7 +127,6 @@ async fn test_permit_full_lifecycle() {
                 agent_id: Uuid::parse_str(agent_id).unwrap(),
                 treasury_id: Uuid::parse_str(treasury_id).unwrap(),
                 wallet_address: "GA5WNX...".to_string(),
-                pool_key: "pool:XLM".to_string(),
                 asset_code: "XLM".to_string(),
                 asset_issuer: None,
                 requested_amount: BigDecimal::from(100),
@@ -147,7 +135,6 @@ async fn test_permit_full_lifecycle() {
                 agent_id: Uuid::parse_str(agent_id).unwrap(),
                 treasury_id: Uuid::parse_str(treasury_id).unwrap(),
                 wallet_address: "GA5WNX...".to_string(),
-                pool_key: "pool:XLM".to_string(),
                 asset_code: "XLM".to_string(),
                 asset_issuer: None,
                 requested_amount: BigDecimal::from(200),

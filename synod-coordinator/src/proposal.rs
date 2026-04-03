@@ -211,7 +211,8 @@ pub async fn sign_proposal(
     crate::stellar::verify_stellar_signature(
         &payload.wallet_address,
         &msg_bytes,
-        &payload.signature_base64
+        &payload.signature_base64,
+        &state.config.stellar.network_passphrase,
     )?;
 
     // 6. Insert signature

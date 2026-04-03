@@ -86,14 +86,13 @@ pub struct HorizonOperation {
 pub enum InflowResult {
     Discarded,
     UnknownAsset { asset_code: String },
-    Routed { pool_key: String, amount: String, asset_code: String },
-    UnroutedInflow,
+    TreasuryInflow { amount: String, asset_code: String },
 }
 
 pub fn classify_inflow(
     op: &HorizonOperation,
     wallet_address: &str,
-    _pool_assets: &[String], // simplified: list of known asset codes
+    monitored_assets: &[String], 
 ) -> InflowResult {
     // Step 1: Is operation type payment, path_payment, or create_account?
     let valid_types = ["payment", "path_payment_strict_receive", "create_account"];
@@ -107,17 +106,16 @@ pub fn classify_inflow(
         return InflowResult::Discarded;
     }
 
-    // Step 3: Is asset in any pool definition?
+    // Step 3: Is asset being monitored?
     let asset_code = op.asset_code.as_deref().unwrap_or("XLM");
-    if !_pool_assets.iter().any(|a| a == asset_code) {
+    if !monitored_assets.iter().any(|a| a == asset_code) {
         return InflowResult::UnknownAsset {
             asset_code: asset_code.to_string(),
         };
     }
 
-    // Steps 4-7: Route to pool (simplified: use asset code as pool key)
-    InflowResult::Routed {
-        pool_key: format!("pool:{}", asset_code),
+    // Route as general treasury inflow
+    InflowResult::TreasuryInflow {
         amount: op.amount.clone().unwrap_or_default(),
         asset_code: asset_code.to_string(),
     }
@@ -200,8 +198,8 @@ impl HorizonWatcher {
         self.save_cursor(&op.paging_token).await;
 
         // Classify
-        let pool_assets = vec!["XLM".to_string(), "USDC".to_string()]; // TODO: fetch from constitution
-        let result = classify_inflow(&op, &self.wallet_address, &pool_assets);
+        let monitored_assets = vec!["XLM".to_string(), "USDC".to_string()]; // TODO: fetch from constitution/redis
+        let result = classify_inflow(&op, &self.wallet_address, &monitored_assets);
 
         match result {
             InflowResult::Discarded => {
@@ -210,23 +208,19 @@ impl HorizonWatcher {
             InflowResult::UnknownAsset { asset_code } => {
                 warn!(wallet = %self.wallet_address, asset = %asset_code, "Unknown asset received");
             }
-            InflowResult::Routed { pool_key, amount, asset_code } => {
+            InflowResult::TreasuryInflow { amount, asset_code } => {
                 info!(
                     wallet = %self.wallet_address,
-                    pool = %pool_key,
                     amount = %amount,
                     asset = %asset_code,
-                    "Inflow routed to pool"
+                    "Treasury inflow detected"
                 );
-                let _ = self.state.tx_events.send(crate::TreasuryEvent::PoolBalanceUpdate {
+                let _ = self.state.tx_events.send(crate::TreasuryEvent::WalletBalanceUpdate {
                     treasury_id: self.treasury_id,
-                    pool_key: pool_key.clone(),
+                    wallet_address: self.wallet_address.clone(),
                     amount: amount.parse().unwrap_or(0.0),
                     asset_code: asset_code.clone(),
                 });
-            }
-            InflowResult::UnroutedInflow => {
-                warn!(wallet = %self.wallet_address, "Unrouted inflow detected");
             }
         }
     }
@@ -383,7 +377,7 @@ mod tests {
         };
 
         let result = classify_inflow(&op, "GWALLET...", &["USDC".to_string(), "XLM".to_string()]);
-        assert!(matches!(result, InflowResult::Routed { .. }));
+        assert!(matches!(result, InflowResult::TreasuryInflow { .. }));
     }
 
     #[test]

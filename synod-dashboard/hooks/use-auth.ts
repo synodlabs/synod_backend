@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useState, useEffect, useCallback, useMemo } from "react"
 import { useRouter } from "next/navigation"
 
 export function useAuth() {
@@ -16,10 +16,19 @@ export function useAuth() {
     }
   }, [router])
 
-  const logout = () => {
+  const logout = useCallback(() => {
     localStorage.removeItem("synod_token")
     router.push("/login")
-  }
+  }, [router])
 
-  return { token, logout }
+  const user = useMemo(() => ({ 
+    name: "Ade Okonkwo", 
+    avatar: "AO" 
+  }), [])
+
+  return { 
+    token, 
+    logout, 
+    user 
+  }
 }

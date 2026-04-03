@@ -39,9 +39,7 @@ async fn test_phase_10_dashboard_and_ws() {
     )
     .bind(treasury_uuid)
     .bind(serde_json::json!({
-        "pools": [
-            { "pool_key": "pool:XLM", "asset_code": "XLM", "target_pct": 100.0 }
-        ]
+        "agent_allocations": []
     }))
     .execute(&ctx.db).await.unwrap();
 
@@ -80,9 +78,9 @@ async fn test_phase_10_dashboard_and_ws() {
     let (mut ws_stream, _) = connect_async(request).await.expect("Failed to connect to WS");
 
     // 6. Broadcast an Event
-    let _event = TreasuryEvent::PoolBalanceUpdate {
+    let _event = TreasuryEvent::WalletBalanceUpdate {
         treasury_id: treasury_uuid,
-        pool_key: "pool:XLM".to_string(),
+        wallet_address: "stellar_wallet".to_string(),
         amount: 55000.0,
         asset_code: "XLM".to_string(),
     };
