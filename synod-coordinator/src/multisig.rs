@@ -102,7 +102,7 @@ pub struct RevokeRequest {
 
 pub async fn revoke_multisig(
     State(state): State<AppState>,
-    auth: AuthUser,
+    _auth: AuthUser,
     Path(treasury_id): Path<Uuid>,
     Json(payload): Json<RevokeRequest>,
 ) -> AppResult<Json<MultisigStatusResponse>> {
@@ -136,7 +136,7 @@ pub async fn revoke_multisig(
     }
 
     // 3. Decode the Envelope and add the Coordinator's signature
-    use crate::stellar::next_xdr::{TransactionEnvelope, TransactionV1Envelope, DecoratedSignature, SignatureHint, Signature, WriteXdr, ReadXdr};
+    use crate::stellar::next_xdr::{TransactionEnvelope, DecoratedSignature, SignatureHint, Signature, WriteXdr, ReadXdr};
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
     let raw_env = BASE64.decode(&payload.xdr)
