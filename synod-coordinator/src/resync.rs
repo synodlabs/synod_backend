@@ -57,14 +57,12 @@ async fn fetch_from_stellar_dex(asset_code: &str, state: &AppState) -> Option<f6
                     if let Some(record) = records.first() {
                         if let Some(avg) = record["avg"].as_str() {
                             if let Ok(price) = avg.parse::<f64>() {
-                                // If we're looking for XLM price, it's the inverse
                                 let final_price = if asset_code == "XLM" {
-                                    1.0 / price // XLM/USDC → USDC per XLM
+                                    1.0 / price
                                 } else {
                                     price
                                 };
 
-                                // Cache in Redis
                                 let mut redis = state.redis.clone();
                                 let key = format!("price:last:{}", asset_code);
                                 let _: redis::RedisResult<()> = redis.set_ex(&key, final_price.to_string(), 3600).await;
@@ -121,7 +119,7 @@ pub struct ResyncResult {
     pub total_aum_usd: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WalletBalance {
     pub wallet_address: String,
     pub asset_code: String,
@@ -135,7 +133,6 @@ pub async fn resync_treasury(
 ) -> AppResult<ResyncResult> {
     info!(treasury = %treasury_id, "Starting balance resync");
 
-    // Step 1-2: Fetch wallets and balances from Horizon REST
     let wallets: Vec<(String,)> = sqlx::query_as(
         "SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 AND status = 'ACTIVE'"
     )
@@ -164,7 +161,6 @@ pub async fn resync_treasury(
                             let balance_str = bal["balance"].as_str().unwrap_or("0");
                             let balance_f64: f64 = balance_str.parse().unwrap_or(0.0);
 
-                            // Step 3: Get USD price
                             let usd_price = fetch_usd_price(&asset_code, state).await;
                             let usd_value = balance_f64 * usd_price;
                             total_aum += usd_value;
@@ -185,7 +181,7 @@ pub async fn resync_treasury(
         }
     }
 
-    // Step 5: Atomically replace Redis snapshot
+    // Atomically replace Redis snapshot
     {
         let mut redis = state.redis.clone();
         let snapshot_key = format!("treasury:snapshot:{}", treasury_id);
@@ -193,19 +189,20 @@ pub async fn resync_treasury(
             .map_err(|e| AppError::Internal(anyhow::anyhow!("JSON error: {}", e)))?;
         let _: redis::RedisResult<()> = redis.set(&snapshot_key, &snapshot_json).await;
 
-        // Update AUM in DB
         let _: redis::RedisResult<()> = redis.set(
             format!("treasury:aum:{}", treasury_id),
             total_aum.to_string(),
         ).await;
     }
 
-    // Step 6: Update DB
-    sqlx::query("UPDATE treasuries SET current_aum_usd = CAST($1 AS NUMERIC(20,7)), updated_at = NOW() WHERE treasury_id = $2")
-        .bind(format!("{:.7}", total_aum))
-        .bind(treasury_id)
-        .execute(&state.db)
-        .await?;
+    // Update peak AUM if current exceeds it
+    sqlx::query(
+        "UPDATE treasuries SET current_aum_usd = CAST($1 AS NUMERIC(20,7)), peak_aum_usd = GREATEST(peak_aum_usd, CAST($1 AS NUMERIC(20,7))), updated_at = NOW() WHERE treasury_id = $2"
+    )
+    .bind(format!("{:.7}", total_aum))
+    .bind(treasury_id)
+    .execute(&state.db)
+    .await?;
 
     info!(treasury = %treasury_id, aum = total_aum, wallets = wallets.len(), "Resync complete");
 
@@ -216,7 +213,7 @@ pub async fn resync_treasury(
     })
 }
 
-// ── Manual Resync Endpoint ──
+// ── Manual Resync Endpoint (works under both /v1/treasuries/:id/resync and /admin) ──
 pub async fn manual_resync(
     State(state): State<AppState>,
     _auth: AuthUser,
@@ -245,7 +242,8 @@ pub async fn scheduled_reconciliation(state: AppState) {
     }
 }
 
-pub fn router() -> Router<AppState> {
+/// Admin-only router (legacy path — kept for backward compat)
+pub fn admin_router() -> Router<AppState> {
     Router::new()
         .route("/treasuries/:id/resync", post(manual_resync))
 }

@@ -36,3 +36,6 @@ http = "1.1"
 
 rand = "0.8.5"
 tokio-tungstenite = "0.24"
+
+[dev-dependencies]
+serial_test = "3.2.0"

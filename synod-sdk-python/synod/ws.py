@@ -39,6 +39,10 @@ class SynodWebSocket:
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
 
+    def update_url(self, url: str) -> None:
+        """Update the connection URL used for future reconnect attempts."""
+        self._url = url
+
     async def stop(self) -> None:
         """Gracefully stop the WebSocket connection."""
         self._running = False

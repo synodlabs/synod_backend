@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { AlertTriangle, CheckCircle2, Copy, Plus, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { useStellarWallet } from "@/hooks/use-stellar-wallet"
 
 export interface AgentSlot {
   agent_id: string
@@ -24,10 +25,10 @@ interface AgentManagerProps {
   isDashboardWidget?: boolean
 }
 
-type ProvisionResult = { agent: AgentSlot; api_key: string }
+type ProvisionResult = { agent: AgentSlot }
 type ProvisionStep = "form" | "success"
 type SdkTab = "python" | "nodejs" | "rust"
-type CopyTarget = "agent_id" | "api_key" | null
+type CopyTarget = "agent_id" | "agent_pubkey" | null
 type SnippetTone = "comment" | "command" | "env" | "keyword" | "call" | "string" | "number" | "plain"
 
 type SnippetLine = {
@@ -42,18 +43,16 @@ const SDK_SNIPPETS: Record<SdkTab, { language: string; lines: SnippetLine[] }> =
       { text: "# Install", tone: "comment" },
       { text: "pip install synod-sdk", tone: "command" },
       { text: "", tone: "plain" },
-      { text: "# Configure", tone: "comment" },
-      { text: 'export SYNOD_API_KEY="synod_agent_xxx..."', tone: "env" },
-      { text: "", tone: "plain" },
-      { text: "# Connect and execute", tone: "comment" },
+      { text: "# Generate local identity", tone: "comment" },
       { text: "from synod import SynodAgent", tone: "keyword" },
-      { text: "import os", tone: "keyword" },
       { text: "", tone: "plain" },
       { text: "agent = SynodAgent(", tone: "plain" },
-      { text: '    api_key=os.environ["SYNOD_API_KEY"],', tone: "plain" },
       { text: '    key_storage_path="./synod_keys",', tone: "string" },
       { text: ")", tone: "plain" },
       { text: "", tone: "plain" },
+      { text: 'print("Enroll this key in Synod:", agent.public_key)', tone: "call" },
+      { text: "", tone: "plain" },
+      { text: "# Connect after the dashboard binds the key", tone: "comment" },
       { text: "await agent.connect()", tone: "call" },
       { text: "await agent.execute(", tone: "call" },
       { text: '    wallet="G...",', tone: "string" },
@@ -69,7 +68,8 @@ const SDK_SNIPPETS: Record<SdkTab, { language: string; lines: SnippetLine[] }> =
       { text: "// Node.js SDK", tone: "comment" },
       { text: "// Python is the primary implementation today.", tone: "comment" },
       { text: "", tone: "plain" },
-      { text: "const agent = new SynodAgent(process.env.SYNOD_API_KEY)", tone: "keyword" },
+      { text: "const agent = new SynodAgent({ keyStoragePath: './synod_keys' })", tone: "keyword" },
+      { text: "console.log(agent.publicKey)", tone: "call" },
       { text: "await agent.connect()", tone: "call" },
       { text: "await agent.execute({ wallet, destination, amount, asset })", tone: "call" },
     ],
@@ -80,16 +80,12 @@ const SDK_SNIPPETS: Record<SdkTab, { language: string; lines: SnippetLine[] }> =
       { text: "// Rust SDK", tone: "comment" },
       { text: "// Python is the primary implementation today.", tone: "comment" },
       { text: "", tone: "plain" },
-      { text: 'let agent = SynodAgent::new(std::env::var("SYNOD_API_KEY")?);', tone: "keyword" },
+      { text: 'let agent = SynodAgent::new("./synod_keys")?;', tone: "keyword" },
+      { text: 'println!("{}", agent.public_key());', tone: "call" },
       { text: "agent.connect().await?;", tone: "call" },
       { text: "agent.execute(wallet, destination, amount, asset).await?;", tone: "call" },
     ],
   },
-}
-
-function truncateMiddle(value: string, left = 6, right = 4) {
-  if (value.length <= left + right + 3) return value
-  return `${value.slice(0, left)}...${value.slice(-right)}`
 }
 
 function formatRelativeTime(value: string | null) {
@@ -218,6 +214,7 @@ export function AgentManager({
   onManageRules,
   isDashboardWidget = true,
 }: AgentManagerProps) {
+  const { connect: connectWallet, sign: signMessage } = useStellarWallet()
   const [showProvisionModal, setShowProvisionModal] = useState(false)
   const [showRevokeModal, setShowRevokeModal] = useState(false)
   const [isProvisioning, setIsProvisioning] = useState(false)
@@ -231,6 +228,10 @@ export function AgentManager({
   const [sdkTab, setSdkTab] = useState<SdkTab>("python")
   const [modalError, setModalError] = useState("")
   const [revokeTarget, setRevokeTarget] = useState<AgentSlot | null>(null)
+  const [enrollmentPubkey, setEnrollmentPubkey] = useState("")
+  const [bindingAgentId, setBindingAgentId] = useState<string | null>(null)
+  const [bindingStatus, setBindingStatus] = useState("")
+  const [bindingError, setBindingError] = useState("")
 
   useEffect(() => {
     if (agents.length === 0) {
@@ -254,6 +255,13 @@ export function AgentManager({
 
     return agents[0] ?? null
   }, [agents, provisionResult, selectedAgentId])
+
+  useEffect(() => {
+    if (!selectedAgent) return
+    setEnrollmentPubkey(selectedAgent.agent_pubkey ?? "")
+    setBindingStatus("")
+    setBindingError("")
+  }, [selectedAgent])
 
   const resetProvisionModal = () => {
     setShowProvisionModal(false)
@@ -331,6 +339,78 @@ export function AgentManager({
     }
   }
 
+  const handleBindPublicKey = async () => {
+    if (!token || !selectedAgent || !enrollmentPubkey.trim()) return
+
+    setBindingAgentId(selectedAgent.agent_id)
+    setBindingStatus("Connecting wallet...")
+    setBindingError("")
+
+    try {
+      const walletAddress = await connectWallet()
+      if (!walletAddress) {
+        setBindingStatus("")
+        return
+      }
+
+      setBindingStatus("Requesting enrollment challenge...")
+      const challengeRes = await fetch(`/v1/agents/${selectedAgent.agent_id}/enroll/challenge`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          wallet_address: walletAddress,
+          agent_pubkey: enrollmentPubkey.trim(),
+        }),
+      })
+
+      if (!challengeRes.ok) {
+        const data = await challengeRes.json().catch(() => null)
+        throw new Error(data?.message || "Failed to create enrollment challenge")
+      }
+
+      const challengeData = await challengeRes.json()
+      const challengeMessage = `synod-enroll:${challengeData.agent_id}:${walletAddress}:${enrollmentPubkey.trim()}:${challengeData.challenge}`
+
+      setBindingStatus("Sign the approval message in your wallet...")
+      const signature = await signMessage(challengeMessage, walletAddress)
+      if (!signature) {
+        throw new Error("Wallet signing rejected")
+      }
+
+      setBindingStatus("Binding public key to this slot...")
+      const enrollRes = await fetch(`/v1/agents/${selectedAgent.agent_id}/enroll-pubkey`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          wallet_address: walletAddress,
+          agent_pubkey: enrollmentPubkey.trim(),
+          challenge: challengeData.challenge,
+          signature,
+        }),
+      })
+
+      if (!enrollRes.ok) {
+        const data = await enrollRes.json().catch(() => null)
+        throw new Error(data?.message || "Failed to bind agent public key")
+      }
+
+      setBindingStatus("Agent key enrolled successfully.")
+      await Promise.resolve(onAgentsChange())
+    } catch (err) {
+      console.error(err)
+      setBindingError(err instanceof Error ? err.message : "Failed to bind public key")
+      setBindingStatus("")
+    } finally {
+      setBindingAgentId(null)
+    }
+  }
+
   const copyToClipboard = async (text: string, target: CopyTarget) => {
     await navigator.clipboard.writeText(text)
     setCopiedTarget(target)
@@ -395,7 +475,9 @@ export function AgentManager({
                         <tr>
                           <td colSpan={4} className="px-6 py-20 text-center">
                             <div className="text-[11px] font-bold uppercase tracking-[0.2em] text-synod-muted">No Agent Slots Yet</div>
-                            <p className="mt-3 text-xs text-synod-muted-dark">Create an agent slot to mint a one-time API key for your agent runtime.</p>
+                            <p className="mt-3 text-xs text-synod-muted-dark">
+                              Create a slot, paste the agent public key, and wallet-sign the binding when you are ready to activate it.
+                            </p>
                           </td>
                         </tr>
                       ) : (
@@ -512,7 +594,7 @@ export function AgentManager({
                 <div className="flex items-center justify-between border-b border-synod-border px-5 py-4">
                   <div>
                     <div className="text-sm font-bold text-white">{selectedAgent.name}</div>
-                    <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">Identity-only slot</div>
+                    <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">Approved agent signer slot</div>
                   </div>
                   <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[9px] font-bold uppercase tracking-[0.18em] ${statusClasses(selectedAgent.status)}`}>
                     {displayStatus(selectedAgent.status)}
@@ -544,10 +626,62 @@ export function AgentManager({
                     </div>
                   </section>
 
-                  <section className="space-y-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">API Key</div>
-                    <div className="rounded-md border border-synod-border bg-black px-4 py-3 text-[11px] text-synod-muted-dark">
-                      Raw API keys are shown once at creation time. If this one is lost, revoke the slot and create a new one.
+                  <section className="space-y-3">
+                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Bind Public Key</div>
+                    <div className="space-y-3 rounded-md border border-synod-border bg-black px-4 py-4">
+                      <p className="text-sm leading-6 text-synod-muted">
+                        Run your agent or `synod-mcp`, copy its public key, paste it here, then sign the binding with your treasury wallet.
+                      </p>
+
+                      <div className="space-y-2">
+                        <label className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Agent Public Key</label>
+                        <textarea
+                          value={enrollmentPubkey}
+                          onChange={(event) => setEnrollmentPubkey(event.target.value.trim())}
+                          rows={3}
+                          placeholder="G..."
+                          className="w-full rounded-xl border border-synod-border bg-[#050508] px-4 py-3 font-mono text-[11px] text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
+                        />
+                      </div>
+
+                      {selectedAgent.agent_pubkey && (
+                        <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-[9px] uppercase tracking-[0.16em] text-emerald-200/80">Enrolled Key</div>
+                              <div className="mt-1 break-all font-mono text-[11px] text-white">{selectedAgent.agent_pubkey}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => copyToClipboard(selectedAgent.agent_pubkey!, "agent_pubkey")}
+                              className="inline-flex items-center rounded-md border border-emerald-400/20 bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-emerald-300/40"
+                            >
+                              <Copy size={12} className="mr-1.5" />
+                              {copiedTarget === "agent_pubkey" ? "Copied" : "Copy"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {bindingError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{bindingError}</div>}
+                      {bindingStatus && !bindingError && (
+                        <div className="rounded-xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-xs text-sky-100">
+                          {bindingStatus}
+                        </div>
+                      )}
+
+                      <div className="flex justify-end">
+                        <Button
+                          type="button"
+                          variant="primary"
+                          size="sm"
+                          onClick={handleBindPublicKey}
+                          disabled={!enrollmentPubkey.trim() || bindingAgentId === selectedAgent.agent_id}
+                          className="h-10 px-4 text-[10px] font-bold uppercase tracking-[0.16em]"
+                        >
+                          {bindingAgentId === selectedAgent.agent_id ? "Binding..." : selectedAgent.agent_pubkey ? "Rebind Key" : "Bind Key"}
+                        </Button>
+                      </div>
                     </div>
                   </section>
 
@@ -555,7 +689,7 @@ export function AgentManager({
                     <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Capital Rules</div>
                     <div className="rounded-md border border-synod-border bg-black px-4 py-4 space-y-3">
                       <p className="text-sm leading-6 text-synod-muted">
-                        This page only manages slot identity and credentials. Wallet access, allocation, tier limits, and concurrency rules live in Policy.
+                        This page only manages slot identity and signer enrollment. Wallet access, allocation, tier limits, and concurrency rules live in Policy.
                       </p>
                       {onManageRules && (
                         <Button
@@ -586,7 +720,16 @@ export function AgentManager({
 
                       <div>
                         <div className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Agent Pubkey</div>
-                        <div className="mt-1 font-mono text-[11px] text-white break-all">{selectedAgent.agent_pubkey ? truncateMiddle(selectedAgent.agent_pubkey, 10, 6) : "Not registered yet"}</div>
+                        <div className="mt-1 font-mono text-[11px] text-white break-all">
+                          {selectedAgent.agent_pubkey ? selectedAgent.agent_pubkey : "Not registered yet"}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Activation Flow</div>
+                        <div className="mt-1 text-[11px] leading-6 text-synod-muted">
+                          Bind the public key, configure capital rules, make the key an on-chain signer, then let the agent complete the Synod Connect challenge.
+                        </div>
                       </div>
                     </div>
                   </section>
@@ -675,7 +818,9 @@ export function AgentManager({
                     <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-300" />
                     <div>
                       <div className="text-sm font-bold text-white">{provisionResult.agent.name}</div>
-                      <p className="mt-2 text-sm leading-6 text-synod-muted">The slot now exists and will appear as pending until an agent connects and rules are configured in Policy.</p>
+                      <p className="mt-2 text-sm leading-6 text-synod-muted">
+                        The slot is ready. Next, run your agent, copy its generated public key, and bind it from this dashboard before the agent calls `connect()`.
+                      </p>
                     </div>
                   </div>
 
@@ -697,22 +842,15 @@ export function AgentManager({
                   </section>
 
                   <section className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">API Key</label>
-                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-h-6 font-mono text-sm text-white break-all">{provisionResult.api_key}</div>
-                        <button
-                          type="button"
-                          onClick={() => copyToClipboard(provisionResult.api_key, "api_key")}
-                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
-                        >
-                          <Copy size={12} className="mr-1.5" />
-                          {copiedTarget === "api_key" ? "Copied" : "Copy"}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-xs leading-6 text-amber-100">
-                      Copy this now. It will never be shown again. If you lose it you must revoke this slot and create a new one.
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">What To Do Next</label>
+                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4 text-sm leading-7 text-synod-muted">
+                      1. Start your agent or `synod-mcp` so it generates a local keypair.
+                      <br />
+                      2. Copy the printed public key into this slot.
+                      <br />
+                      3. Sign the binding with your wallet.
+                      <br />
+                      4. Let the agent finish Synod Connect and open its WebSocket session.
                     </div>
                   </section>
                 </div>
@@ -756,7 +894,7 @@ export function AgentManager({
                 <div>
                   <div className="text-sm font-bold text-white">{revokeTarget.name}</div>
                   <p className="mt-2 text-sm leading-6 text-synod-muted">
-                    Revoking this slot disconnects the agent and permanently invalidates its API key. Use this only when the slot should be retired.
+                    Revoking this slot disconnects the agent, invalidates its runtime session, and removes the enrolled signer identity. Use this only when the slot should be retired.
                   </p>
                 </div>
               </div>

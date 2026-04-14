@@ -1,23 +1,22 @@
-"""Synod Agent SDK — main entry point.
+"""Synod Agent SDK for the Synod Connect public-key enrollment flow."""
 
-Usage:
-    synod = SynodAgent(api_key="synod_agent_xxx...", key_storage_path="./synod_keys")
-    await synod.connect()
-    result = await synod.execute(wallet="GDQP...", destination="GBRP...", amount=4500, asset="USDC")
-"""
+from __future__ import annotations
 
 import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
 
 import aiohttp
-from stellar_sdk import (
-    Keypair, Server, TransactionBuilder, Network, Asset
-)
+from stellar_sdk import Asset, Keypair, Network, Server, TransactionBuilder
 
-from .crypto import generate_keypair, keypair_from_secret, load_keypair
+from .crypto import (
+    build_signed_request_auth,
+    generate_keypair,
+    keypair_from_secret,
+    sign_stellar_message,
+)
 from .errors import (
     AgentNotActiveError,
     AgentSuspendedError,
@@ -39,7 +38,6 @@ logger = logging.getLogger("synod")
 
 @dataclass
 class WalletHeadroom:
-    """Current headroom state for a wallet."""
     wallet_address: str
     max_usd: float
     reserved_usd: float
@@ -49,7 +47,6 @@ class WalletHeadroom:
 
 @dataclass
 class ExecuteResult:
-    """Result from a successful execute() call."""
     tx_hash: str
     permit_id: str
     requested_amount: float
@@ -58,16 +55,10 @@ class ExecuteResult:
 
 
 class SynodAgent:
-    """Synod Agent SDK — connect, execute, and manage treasury operations.
-
-    Initialization supports two paths:
-        Path 1 (new keypair): SynodAgent(api_key=..., key_storage_path=...)
-        Path 2 (existing key): SynodAgent(api_key=..., existing_secret_key=...)
-    """
+    """Synod Connect SDK client using one local agent keypair."""
 
     def __init__(
         self,
-        api_key: str,
         key_storage_path: str | None = None,
         existing_secret_key: str | None = None,
         coordinator_url: str = "http://localhost:8080",
@@ -76,24 +67,20 @@ class SynodAgent:
         connect_timeout_seconds: int = 900,
         log_level: str = "INFO",
     ):
-        self._api_key = api_key
         self._coordinator_url = coordinator_url.rstrip("/")
         self._network = network
         self._reject_partial = reject_partial
         self._connect_timeout = connect_timeout_seconds
 
-        # Set up logging (never log api_key or secret key)
         logging.basicConfig(level=getattr(logging, log_level.upper(), logging.INFO))
 
-        # Initialize keypair
         if existing_secret_key:
             self._keypair = keypair_from_secret(existing_secret_key)
         elif key_storage_path:
-            self._keypair = generate_keypair(api_key, key_storage_path)
+            self._keypair = generate_keypair(key_storage_path)
         else:
             raise ValueError("Must provide either key_storage_path or existing_secret_key")
 
-        # State
         self._agent_id: str | None = None
         self._treasury_id: str | None = None
         self._status: str = "DISCONNECTED"
@@ -101,6 +88,9 @@ class SynodAgent:
         self._reason_code: str | None = "NOT_CONNECTED"
         self._wallet_access: list[dict] = []
         self._coordinator_pubkey: str | None = None
+        self._session_token: str | None = None
+        self._websocket_token: str | None = None
+        self._ticket_expires_at: str | None = None
         self._ws: SynodWebSocket | None = None
         self._session: aiohttp.ClientSession | None = None
         self._treasury_halted: bool = False
@@ -109,7 +99,6 @@ class SynodAgent:
         self._connection_task: asyncio.Task | None = None
         self._runtime_started: bool = False
 
-        # Stellar network config
         if network == "mainnet":
             self._network_passphrase = Network.PUBLIC_NETWORK_PASSPHRASE
             self._horizon_url = "https://horizon.stellar.org"
@@ -117,51 +106,62 @@ class SynodAgent:
             self._network_passphrase = Network.TESTNET_NETWORK_PASSPHRASE
             self._horizon_url = "https://horizon-testnet.stellar.org"
 
-    # ── Connection ──
+    @property
+    def public_key(self) -> str:
+        return self._keypair.public_key
 
     async def connect(self) -> dict:
-        """Perform the agent handshake with the coordinator."""
         await self._ensure_session()
 
         try:
-            resp = await self._session.post(
-                f"{self._coordinator_url}/v1/agents/connect",
+            challenge_resp = await self._session.post(
+                f"{self._coordinator_url}/v1/agents/connect/challenge",
+                json={"agent_pubkey": self.public_key},
+            )
+
+            if challenge_resp.status == 404:
+                raise SynodConnectionError(
+                    "Agent public key is not enrolled in Synod yet. Paste this key into the dashboard slot first."
+                )
+            if challenge_resp.status == 403:
+                data = await challenge_resp.json()
+                code = data.get("error", "")
+                if code == "AGENT_SUSPENDED":
+                    raise AgentSuspendedError()
+                raise SynodConnectionError(f"Connection forbidden: {code}")
+            if not challenge_resp.ok:
+                data = await challenge_resp.json()
+                raise SynodConnectionError(f"Challenge request failed: {data}")
+
+            challenge_data = await challenge_resp.json()
+            signed_message = sign_stellar_message(
+                self._keypair,
+                f"synod-connect:{challenge_data['agent_id']}:{challenge_data['treasury_id']}:{self.public_key}:{challenge_data['challenge']}",
+            )
+
+            complete_resp = await self._session.post(
+                f"{self._coordinator_url}/v1/agents/connect/complete",
                 json={
-                    "api_key": self._api_key,
-                    "agent_pubkey": self._keypair.public_key,
+                    "agent_pubkey": self.public_key,
+                    "challenge": challenge_data["challenge"],
+                    "signature": signed_message,
                 },
             )
 
-            if resp.status == 401:
-                raise SynodConnectionError("Invalid API key")
-            elif resp.status == 403:
-                data = await resp.json()
-                code = data.get("error", "")
-                if code == "AGENT_REVOKED":
-                    raise SynodConnectionError("Agent has been revoked")
-                elif code == "AGENT_SUSPENDED":
-                    raise AgentSuspendedError()
-                else:
-                    raise SynodConnectionError(f"Connection forbidden: {code}")
-            elif resp.status == 409:
-                raise SynodConnectionError(
-                    "Pubkey conflict - this agent slot already has a different registered keypair"
-                )
-            elif not resp.ok:
-                data = await resp.json()
-                raise SynodConnectionError(f"Handshake failed: {data}")
+            if not complete_resp.ok:
+                data = await complete_resp.json()
+                raise SynodConnectionError(f"Connection completion failed: {data}")
 
-            data = await resp.json()
+            data = await complete_resp.json()
             self._apply_status_payload(data)
+            self._session_token = data.get("session_token")
+            self._websocket_token = data.get("websocket_token")
+            self._ticket_expires_at = data.get("expires_at")
 
             if self._connection_phase == "COMPLETE" and self._status == "ACTIVE":
                 await self._ensure_runtime_started()
             elif self._agent_id and (self._connection_task is None or self._connection_task.done()):
-                logger.info(
-                    "Agent %s pending activation (%s)",
-                    self._agent_id,
-                    self._reason_code,
-                )
+                logger.info("Agent %s pending activation (%s)", self._agent_id, self._reason_code)
                 self._connection_task = asyncio.create_task(self._poll_until_active())
 
             return {
@@ -171,54 +171,28 @@ class SynodAgent:
                 "connection_phase": self._connection_phase,
                 "reason_code": self._reason_code,
                 "wallet_access": self._wallet_access,
+                "public_key": self.public_key,
+                "expires_at": self._ticket_expires_at,
             }
+        except aiohttp.ClientError as exc:
+            raise SynodConnectionError(f"Cannot reach coordinator: {exc}") from exc
 
-        except aiohttp.ClientError as e:
-            raise SynodConnectionError(f"Cannot reach coordinator: {e}")
+    async def get_status(self) -> dict:
+        if not self._agent_id:
+            raise SynodConnectionError("Agent has not connected yet")
 
-    async def _poll_until_active(self) -> None:
-        """Poll the coordinator until the agent reaches ACTIVE or a terminal state."""
-        start = time.monotonic()
-        interval = 3.0
+        await self._ensure_session()
+        await self._ensure_runtime_ticket()
+        resp = await self._session.get(
+            f"{self._coordinator_url}/v1/agents/{self._agent_id}/status",
+            headers=self._auth_headers(),
+        )
+        if not resp.ok:
+            raise SynodConnectionError("Failed to fetch agent status")
 
-        while True:
-            elapsed = time.monotonic() - start
-            if elapsed > self._connect_timeout:
-                self._reason_code = "CONNECT_TIMEOUT"
-                logger.error(
-                    "Agent %s did not become active within %ss",
-                    self._agent_id,
-                    self._connect_timeout,
-                )
-                return
-
-            await asyncio.sleep(interval)
-
-            try:
-                await self.get_status()
-            except Exception as exc:
-                logger.warning("Activation poll failed: %s", exc)
-                continue
-
-            if self._connection_phase == "COMPLETE" and self._status == "ACTIVE":
-                logger.info("Agent %s reached ACTIVE", self._agent_id)
-                await self._ensure_runtime_started()
-                return
-
-            if self._connection_phase == "FAILED":
-                logger.error(
-                    "Agent %s activation failed (%s)",
-                    self._agent_id,
-                    self._reason_code,
-                )
-                return
-
-            logger.debug(
-                "Agent %s still pending activation (%s, %.0fs elapsed)",
-                self._agent_id,
-                self._reason_code,
-                elapsed,
-            )
+        data = await resp.json()
+        self._apply_status_payload(data)
+        return data
 
     async def execute(
         self,
@@ -229,118 +203,95 @@ class SynodAgent:
         asset_issuer: str | None = None,
         reject_partial: bool | None = None,
     ) -> ExecuteResult:
-        """Execute a transaction through the Synod permit system.
-
-        1. Request permit → 2. Build tx → 3. Agent sign → 4. Cosign → 5. Submit → 6. Report outcome
-        """
         self._check_state()
+        await self._ensure_session()
+        await self._ensure_runtime_ticket()
 
-        # Validate wallet access
-        wallet_config = None
-        for wa in self._wallet_access:
-            if wa["wallet_address"] == wallet:
-                wallet_config = wa
-                break
+        wallet_config = next((wa for wa in self._wallet_access if wa["wallet_address"] == wallet), None)
         if wallet_config is None:
             raise WalletNotAssignedError(f"Wallet {wallet} not assigned to this agent")
 
         use_reject_partial = reject_partial if reject_partial is not None else self._reject_partial
+        permit_payload = {
+            "agent_id": self._agent_id,
+            "treasury_id": self._treasury_id,
+            "wallet_address": wallet,
+            "asset_code": asset,
+            "asset_issuer": asset_issuer or "",
+            "requested_amount": amount,
+        }
+        permit_body = {
+            **permit_payload,
+            "request_auth": self._signed_auth("permit.request", permit_payload),
+        }
 
-        # 1. Request permit
         permit_resp = await self._session.post(
             f"{self._coordinator_url}/v1/permits/request",
-            json={
-                "agent_id": self._agent_id,
-                "treasury_id": self._treasury_id,
-                "wallet_address": wallet,
-                "asset_code": asset,
-                "asset_issuer": asset_issuer or "",
-                "requested_amount": amount,
-            },
-            headers={"Authorization": f"Bearer {self._api_key}"},
+            json=permit_body,
+            headers=self._auth_headers(),
         )
-
         if not permit_resp.ok:
             data = await permit_resp.json()
-            error_code = data.get("error", "")
-            msg = data.get("message", "")
-            self._raise_permit_error(error_code, msg, amount)
+            self._raise_permit_error(data.get("error", ""), data.get("message", ""), amount)
 
         permit_data = await permit_resp.json()
-
         if not permit_data.get("approved"):
-            reason = permit_data.get("deny_reason", "UNKNOWN")
-            policy_check = permit_data.get("policy_check_number")
-            raise PermitDeniedError(reason, policy_check)
+            raise PermitDeniedError(permit_data.get("deny_reason", "UNKNOWN"), permit_data.get("policy_check_number"))
 
         approved_amount = float(permit_data.get("approved_amount", 0))
         is_partial = approved_amount < amount
-
         if is_partial and use_reject_partial:
             raise PartialApprovalError(approved_amount, amount)
 
         effective_amount = approved_amount if is_partial else amount
         permit_id = permit_data.get("permit_id", "")
 
-        # Check permit TTL — refuse if within 30s of expiry
-        # (permit_data may include "expires_at")
-
-        # 2. Build Stellar transaction
         stellar_asset = Asset.native() if asset == "XLM" else Asset(asset, asset_issuer)
         server = Server(self._horizon_url)
-        source_account = await asyncio.get_event_loop().run_in_executor(
-            None, server.load_account, wallet
-        )
+        source_account = await asyncio.get_event_loop().run_in_executor(None, server.load_account, wallet)
 
-        tx_builder = TransactionBuilder(
-            source_account=source_account,
-            network_passphrase=self._network_passphrase,
-            base_fee=100_000,
-        )
         tx = (
-            tx_builder
+            TransactionBuilder(
+                source_account=source_account,
+                network_passphrase=self._network_passphrase,
+                base_fee=100_000,
+            )
             .append_payment_op(destination, stellar_asset, str(effective_amount))
-            .add_text_memo(permit_id[:28])  # Stellar memo max 28 chars
+            .add_text_memo(permit_id[:28])
             .set_timeout(300)
             .build()
         )
-
-        # 3. Agent signs (shard 1)
         tx.sign(self._keypair)
         signed_xdr = tx.to_xdr()
 
-        # 4. Co-sign with coordinator (shard 2)
+        cosign_payload = {"xdr": signed_xdr}
         cosign_resp = await self._session.post(
             f"{self._coordinator_url}/v1/permits/{permit_id}/cosign",
-            json={"xdr": signed_xdr},
-            headers={"Authorization": f"Bearer {self._api_key}"},
+            json={
+                **cosign_payload,
+                "request_auth": self._signed_auth("permit.cosign", signed_xdr),
+            },
+            headers=self._auth_headers(),
         )
-
         if not cosign_resp.ok:
             data = await cosign_resp.json()
             raise SynodConnectionError(f"Co-sign failed: {data.get('message', '')}")
 
         cosign_data = await cosign_resp.json()
-
-        # 5. Submit to Stellar
-        # The coordinator returns the fully signed XDR or just a signature.
-        # For now, use the tx_hash from the coordinator response.
         tx_hash = cosign_data.get("tx_hash", "")
 
-        # 6. Report outcome to coordinator
+        outcome_payload = {
+            "tx_hash": tx_hash,
+            "pnl_usd": "0.0",
+            "final_amount_units": str(effective_amount),
+        }
         await self._session.post(
             f"{self._coordinator_url}/v1/permits/{permit_id}/outcome",
             json={
-                "tx_hash": tx_hash,
-                "pnl_usd": "0.0",
-                "final_amount_units": str(effective_amount),
+                **outcome_payload,
+                "request_auth": self._signed_auth("permit.outcome", outcome_payload),
             },
-            headers={"Authorization": f"Bearer {self._api_key}"},
-        )
-
-        logger.info(
-            "Transaction executed: permit=%s tx=%s amount=%.2f",
-            permit_id, tx_hash, effective_amount,
+            headers=self._auth_headers(),
         )
 
         return ExecuteResult(
@@ -351,63 +302,67 @@ class SynodAgent:
             partial=is_partial,
         )
 
-    # ── State Query Methods ──
-
     async def get_headroom(self, wallet: str) -> WalletHeadroom:
-        """Get current headroom for a wallet without making a permit request."""
         self._check_state()
-
-        resp = await self._session.get(
-            f"{self._coordinator_url}/v1/agents/{self._agent_id}/status"
-        )
-        if not resp.ok:
-            raise SynodConnectionError("Failed to fetch agent status")
-
-        data = await resp.json()
+        await self._ensure_runtime_ticket()
+        data = await self.get_status()
         for wa in data.get("wallet_access", []):
             if wa["wallet_address"] == wallet:
                 max_usd = float(wa.get("agent_max_usd", "0"))
                 aum = float(wa.get("current_wallet_aum_usd", "0"))
-                # reserved_usd would need a separate query to the coordinator
                 return WalletHeadroom(
                     wallet_address=wallet,
                     max_usd=max_usd,
-                    reserved_usd=0.0,  # TODO: fetch from coordinator
+                    reserved_usd=0.0,
                     available_usd=max_usd,
                     wallet_aum_usd=aum,
                 )
-
         raise WalletNotAssignedError(f"Wallet {wallet} not assigned to this agent")
 
     async def get_active_permits(self) -> list[dict]:
-        """Get all active permits this agent holds."""
         self._check_state()
-        # The coordinator doesn't have a specific endpoint yet —
-        # this would be GET /v1/permits?agent_id=... 
-        # For now, return empty list as placeholder.
-        logger.info("get_active_permits: not yet implemented on coordinator")
+        logger.info("get_active_permits is not yet implemented on the coordinator")
         return []
 
-    async def get_status(self) -> dict:
-        """Get agent's current status and access configuration."""
+    async def close(self) -> None:
+        if self._connection_task:
+            self._connection_task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        if self._ws:
+            await self._ws.stop()
+        if self._session:
+            await self._session.close()
+        self._runtime_started = False
+
+    async def _poll_until_active(self) -> None:
+        start = time.monotonic()
+        while True:
+            if time.monotonic() - start > self._connect_timeout:
+                self._reason_code = "CONNECT_TIMEOUT"
+                raise ConnectTimeoutError()
+
+            await asyncio.sleep(3.0)
+            await self.get_status()
+
+            if self._connection_phase == "COMPLETE" and self._status == "ACTIVE":
+                await self._ensure_runtime_started()
+                return
+
+            if self._connection_phase == "FAILED":
+                return
+
+    def _signed_auth(self, op_name: str, payload: dict | str) -> dict:
         if not self._agent_id:
             raise SynodConnectionError("Agent has not connected yet")
+        return build_signed_request_auth(self._keypair, self._agent_id, op_name, payload)
 
-        await self._ensure_session()
-        resp = await self._session.get(
-            f"{self._coordinator_url}/v1/agents/{self._agent_id}/status"
-        )
-        if not resp.ok:
-            raise SynodConnectionError("Failed to fetch agent status")
-
-        data = await resp.json()
-        self._apply_status_payload(data)
-        return data
-
-    # Internal Helpers
+    def _auth_headers(self) -> dict[str, str]:
+        if not self._session_token:
+            raise SynodConnectionError("Agent session is not established")
+        return {"Authorization": f"Bearer {self._session_token}"}
 
     def _check_state(self) -> None:
-        """Check that the agent is in a valid state for operations."""
         if self._treasury_halted:
             raise TreasuryHaltedError()
         if self._agent_suspended:
@@ -418,6 +373,53 @@ class SynodAgent:
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
+
+    def _seconds_until_ticket_expiry(self) -> float | None:
+        if not self._ticket_expires_at:
+            return None
+
+        try:
+            expires_at = datetime.fromisoformat(self._ticket_expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+        return (expires_at - datetime.now(timezone.utc)).total_seconds()
+
+    async def _ensure_runtime_ticket(self, min_ttl_seconds: int = 120) -> None:
+        if not self._session_token:
+            return
+
+        seconds_left = self._seconds_until_ticket_expiry()
+        if seconds_left is not None and seconds_left > min_ttl_seconds:
+            return
+
+        await self._refresh_runtime_ticket()
+
+    async def _refresh_runtime_ticket(self, websocket_only: bool = False) -> None:
+        if not self._session_token:
+            raise SynodConnectionError("Agent session is not established")
+
+        await self._ensure_session()
+        resp = await self._session.post(
+            f"{self._coordinator_url}/v1/agents/ws-ticket/refresh",
+            json={"websocket_only": websocket_only},
+            headers=self._auth_headers(),
+        )
+        if not resp.ok:
+            try:
+                data = await resp.json()
+            except Exception:
+                data = {}
+            raise SynodConnectionError(f"Failed to refresh runtime ticket: {data}")
+
+        data = await resp.json()
+        self._session_token = data.get("session_token", self._session_token)
+        self._websocket_token = data.get("websocket_token", self._websocket_token)
+        self._ticket_expires_at = data.get("expires_at", self._ticket_expires_at)
+
+        if self._ws and self._agent_id:
+            ws_base = self._coordinator_url.replace("http://", "ws://").replace("https://", "wss://")
+            self._ws.update_url(f"{ws_base}/v1/agents/ws/{self._agent_id}?token={self._websocket_token}")
 
     def _apply_status_payload(self, data: dict) -> None:
         self._agent_id = data.get("agent_id", self._agent_id)
@@ -436,8 +438,9 @@ class SynodAgent:
         if self._runtime_started or not self._agent_id:
             return
 
+        await self._ensure_runtime_ticket()
         ws_base = self._coordinator_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url = f"{ws_base}/v1/agents/ws/{self._agent_id}"
+        ws_url = f"{ws_base}/v1/agents/ws/{self._agent_id}?token={self._websocket_token}"
         self._ws = SynodWebSocket(
             url=ws_url,
             on_event=self._handle_ws_event,
@@ -451,87 +454,60 @@ class SynodAgent:
         self._runtime_started = True
 
     def _raise_permit_error(self, error_code: str, message: str, requested: float) -> None:
-
-        """Map coordinator error codes to SDK exceptions."""
         if error_code == "CONCURRENT_LIMIT":
             raise ConcurrentLimitError()
-        elif error_code == "TREASURY_HALTED":
+        if error_code == "TREASURY_HALTED":
             raise TreasuryHaltedError()
-        elif error_code == "AGENT_SUSPENDED":
+        if error_code == "AGENT_SUSPENDED":
             raise AgentSuspendedError()
-        elif "allocation" in message.lower():
+        if "allocation" in message.lower():
             raise AllocationLimitError(0, 0, requested)
-        elif "tier" in message.lower():
+        if "tier" in message.lower():
             raise TierLimitError(0, requested)
-        elif "drawdown" in message.lower():
+        if "drawdown" in message.lower():
             raise DrawdownLimitError()
-        else:
-            raise PermitDeniedError(message)
+        raise PermitDeniedError(message)
 
     async def _handle_ws_event(self, event: dict) -> None:
-        """Process events received from the coordinator WebSocket stream."""
         event_type = event.get("type", "")
-
         if event_type == "WALLET_AUM_UPDATE":
-            # Update local headroom state
             wallet = event.get("wallet_address")
             new_max = event.get("agent_new_max_usd")
             for wa in self._wallet_access:
                 if wa["wallet_address"] == wallet:
                     wa["current_wallet_aum_usd"] = event.get("new_aum_usd", wa.get("current_wallet_aum_usd"))
                     wa["agent_max_usd"] = str(new_max) if new_max else wa.get("agent_max_usd")
-
         elif event_type == "TREASURY_HALTED":
-            logger.warning("TREASURY HALTED — pausing operations")
             self._treasury_halted = True
-
         elif event_type == "TREASURY_RESUMED":
-            logger.info("Treasury resumed — operations can restart")
             self._treasury_halted = False
-
         elif event_type == "AGENT_SUSPENDED":
-            logger.warning("AGENT SUSPENDED — all operations blocked")
             self._agent_suspended = True
-
         elif event_type == "CONSTITUTION_UPDATED":
-            logger.info("Constitution updated — refreshing access config")
             try:
                 await self.get_status()
-            except Exception as e:
-                logger.error("Failed to refresh status after constitution update: %s", e)
-
-        elif event_type in ("PERMIT_ISSUED", "PERMIT_CONSUMED", "PERMIT_EXPIRED"):
-            logger.debug("Permit event: %s", event)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.error("Failed to refresh status after constitution update: %s", exc)
 
     async def _handle_ws_disconnect(self) -> None:
-        """Handle prolonged WebSocket disconnection (>5 minutes)."""
-        logger.error("Coordinator unreachable for extended period")
-        # Resync state on reconnect
+        try:
+            await self._refresh_runtime_ticket(websocket_only=True)
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("WebSocket ticket refresh failed: %s", exc)
+
         try:
             await self.get_status()
         except Exception:
             pass
 
     async def _heartbeat_loop(self) -> None:
-        """Send heartbeat to coordinator every 60 seconds."""
         while True:
             await asyncio.sleep(60)
             try:
+                await self._ensure_runtime_ticket()
                 await self._session.post(
-                    f"{self._coordinator_url}/v1/agents/{self._agent_id}/heartbeat"
+                    f"{self._coordinator_url}/v1/agents/{self._agent_id}/heartbeat",
+                    headers=self._auth_headers(),
                 )
-            except Exception as e:
-                logger.warning("Heartbeat failed: %s", e)
-
-    async def close(self) -> None:
-        """Close all connections and clean up."""
-        if self._connection_task:
-            self._connection_task.cancel()
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-        if self._ws:
-            await self._ws.stop()
-        if self._session:
-            await self._session.close()
-        self._runtime_started = False
-        logger.info("SynodAgent closed")
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning("Heartbeat failed: %s", exc)

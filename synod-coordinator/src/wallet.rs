@@ -115,6 +115,33 @@ pub async fn verify_ownership(
     .execute(&state.db)
     .await?;
 
+    // Spawn Horizon watcher for this wallet
+    let treasury_row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT treasury_id FROM treasury_wallets WHERE wallet_address = $1 AND status = 'ACTIVE' LIMIT 1"
+    )
+    .bind(&payload.wallet_address)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if let Some((treasury_id,)) = treasury_row {
+        let wallet_addr = payload.wallet_address.clone();
+        let state_clone = state.clone();
+        let handle = tokio::spawn(async move {
+            let mut watcher = crate::horizon::HorizonWatcher::new(
+                wallet_addr.clone(),
+                treasury_id,
+                state_clone,
+            );
+            watcher.run().await;
+        });
+
+        let mut handles = state.watcher_handles.lock().await;
+        // If a watcher was already running for this wallet, abort it first
+        if let Some(old) = handles.insert(payload.wallet_address.clone(), handle) {
+            old.abort();
+        }
+    }
+
     Ok(Json(VerifyOwnershipResponse { verified: true }))
 }
 
@@ -176,6 +203,15 @@ pub async fn disconnect_wallet(
     .bind(&payload.wallet_address)
     .execute(&state.db)
     .await?;
+
+    // Abort the Horizon watcher for this wallet
+    {
+        let mut handles = state.watcher_handles.lock().await;
+        if let Some(handle) = handles.remove(&payload.wallet_address) {
+            handle.abort();
+            tracing::info!(wallet = %payload.wallet_address, "Horizon watcher stopped");
+        }
+    }
 
     Ok(Json(ConnectResponse { success: true }))
 }

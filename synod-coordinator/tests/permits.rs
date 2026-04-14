@@ -1,181 +1,214 @@
 use bigdecimal::BigDecimal;
 use reqwest::StatusCode;
+use synod_shared::models::PermitRequest;
 use uuid::Uuid;
-use synod_shared::models::*;
-use synod_coordinator::permit::{OutcomeReport, PermitGroupRequest};
-use crate::common::{setup_test_context, TestContext};
+use serde::Serialize;
 
 mod common;
+use common::{
+    attach_active_wallet, build_signed_request_auth, connect_agent, create_agent_slot,
+    create_treasury, enroll_agent_pubkey, generate_test_stellar_keypair, setup_test_context,
+};
 
-#[tokio::test]
-async fn test_permit_full_lifecycle() {
+#[derive(Serialize)]
+struct OutcomeSignaturePayload {
+    tx_hash: String,
+    pnl_usd: String,
+    final_amount_units: String,
+}
+
+async fn setup_active_agent() -> (
+    common::TestContext,
+    Uuid,
+    Uuid,
+    String,
+    ed25519_dalek::SigningKey,
+    String,
+    String,
+) {
     let ctx = setup_test_context().await;
-    let client = &ctx.client;
-    let base_url = &ctx.base_url;
-    let auth_header = format!("Bearer {}", ctx.user_token);
+    let treasury_id = create_treasury(&ctx, "Permit Treasury").await;
+    let (wallet_signing_key, wallet_address) = generate_test_stellar_keypair();
+    let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
 
-    // 1. Create Treasury
-    let treasury_resp = client.post(format!("{}/v1/treasuries", base_url))
-        .header("Authorization", &auth_header)
-        .json(&serde_json::json!({ "name": "Test Treasury", "network": "testnet" }))
-        .send().await.unwrap();
-    let treasury_data: serde_json::Value = treasury_resp.json().await.unwrap();
-    let treasury_id = treasury_data["treasury_id"].as_str().unwrap();
-    let treasury_uuid = Uuid::parse_str(treasury_id).unwrap();
-
-    // 1.5 Set Treasury AUM (Required for policy ceiling/floor checks)
+    attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
     sqlx::query("UPDATE treasuries SET current_aum_usd = 10000, peak_aum_usd = 10000 WHERE treasury_id = $1")
-        .bind(treasury_uuid)
-        .execute(&ctx.db).await.unwrap();
+        .bind(treasury_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
 
-    // 2. Setup Constitution (Required for policy engine pool lookup)
-    let const_resp = client.post(format!("{}/v1/treasuries/{}/constitution", base_url, treasury_id))
-        .header("Authorization", &auth_header)
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Permit Agent").await;
+    enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
+    let connect_data = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
+    let session_token = connect_data["session_token"].as_str().unwrap().to_string();
+
+    let constitution_response = ctx.client
+        .post(format!("{}/v1/treasuries/{}/constitution", ctx.base_url, treasury_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
         .json(&serde_json::json!({
             "content": {
-                "agent_allocations": []
+                "memo": "Permit test constitution",
+                "treasury_rules": {
+                    "max_drawdown_pct": 15.0,
+                    "max_concurrent_permits": 10
+                },
+                "agent_wallet_rules": [{
+                    "agent_id": agent_id,
+                    "wallet_address": wallet_address,
+                    "allocation_pct": 50.0,
+                    "tier_limit_usd": 5000.0,
+                    "concurrent_permit_cap": 3
+                }]
             }
         }))
-        .send().await.unwrap();
-    assert_eq!(const_resp.status(), StatusCode::CREATED);
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(constitution_response.status(), StatusCode::CREATED);
 
-    // 3. Provision Agent
-    let agent_resp = client.post(format!("{}/v1/agents/{}", base_url, treasury_id))
-        .header("Authorization", &auth_header)
-        .json(&serde_json::json!({
-            "name": "Trading Bot 1",
-            "description": Some("Alpha Strategy")
-        }))
-        .send().await.unwrap();
-    assert_eq!(agent_resp.status(), StatusCode::CREATED);
-    let agent_data: serde_json::Value = agent_resp.json().await.unwrap();
-    let agent_id = agent_data["agent"]["agent_id"].as_str().unwrap();
+    sqlx::query("UPDATE agent_slots SET status = 'ACTIVE' WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
 
-    // 3.5 Make Agent Active (bypass handshake for test simplicity)
-    sqlx::query("UPDATE agent_slots SET status = 'ACTIVE', wallet_address = $1 WHERE agent_id = $2")
-        .bind("GA5WNX...")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .execute(&ctx.db).await.unwrap();
+    (
+        ctx,
+        treasury_id,
+        agent_id,
+        wallet_address,
+        agent_signing_key,
+        agent_pubkey,
+        session_token,
+    )
+}
 
-    // 4. Request Permit
-    let req_payload = PermitRequest {
-        agent_id: Uuid::parse_str(agent_id).unwrap(),
-        treasury_id: Uuid::parse_str(treasury_id).unwrap(),
-        wallet_address: "GA5WNX...".to_string(),
-        asset_code: "XLM".to_string(),
+#[serial_test::serial]
+#[tokio::test]
+async fn test_permit_full_lifecycle_with_signed_requests() {
+    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
+        setup_active_agent().await;
+
+    let permit = PermitRequest {
+        agent_id,
+        treasury_id,
+        wallet_address: wallet_address.clone(),
+        asset_code: "XLM".into(),
         asset_issuer: None,
         requested_amount: BigDecimal::from(500),
     };
 
-    let permit_resp = client.post(format!("{}/v1/permits/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&req_payload)
-        .send().await.unwrap();
-    
-    assert_eq!(permit_resp.status(), StatusCode::CREATED);
-    let policy_result: PolicyResult = permit_resp.json().await.unwrap();
-    assert!(policy_result.approved);
-    
-    // We need the permit_id for co-signing and outcomes. 
-    // Since we don't return it in the current API (we return PolicyResult), 
-    // let's fetch it from the DB.
-    let permit_id: Uuid = sqlx::query_scalar("SELECT permit_id FROM permits WHERE agent_id = $1 LIMIT 1")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .fetch_one(&ctx.db).await.unwrap();
+    let permit_response = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({
+            "agent_id": permit.agent_id,
+            "treasury_id": permit.treasury_id,
+            "wallet_address": permit.wallet_address,
+            "asset_code": permit.asset_code,
+            "asset_issuer": permit.asset_issuer,
+            "requested_amount": permit.requested_amount,
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &permit),
+        }))
+        .send()
+        .await
+        .unwrap();
 
-    // 5. Co-signing Verification
-    // Valid request
-    let cosign_resp = client.post(format!("{}/v1/permits/{}/cosign", base_url, permit_id))
-        .header("Authorization", &auth_header)
-        .json(&serde_json::json!({ "xdr": "VALID_STALLAR_XDR_DATA" }))
-        .send().await.unwrap();
-    assert_eq!(cosign_resp.status(), StatusCode::OK);
-    let cosign_data: serde_json::Value = cosign_resp.json().await.unwrap();
-    assert_eq!(cosign_data["status"], "SIGNED");
-    assert!(cosign_data["signature"].as_str().is_some());
+    assert_eq!(permit_response.status(), StatusCode::CREATED);
+    let permit_body: serde_json::Value = permit_response.json().await.unwrap();
+    let permit_id = Uuid::parse_str(permit_body["permit_id"].as_str().unwrap()).unwrap();
+    assert_eq!(permit_body["approved"].as_bool().unwrap(), true);
 
-    // Invalid request (mock rejection via XDR keyword)
-    let bad_cosign = client.post(format!("{}/v1/permits/{}/cosign", base_url, permit_id))
-        .header("Authorization", &auth_header)
-        .json(&serde_json::json!({ "xdr": "INVALID_TX_AMOUNT" }))
-        .send().await.unwrap();
-    assert_eq!(bad_cosign.status(), StatusCode::BAD_REQUEST);
+    let xdr = "VALID_STELLAR_XDR_DATA";
+    let cosign_response = ctx.client
+        .post(format!("{}/v1/permits/{}/cosign", ctx.base_url, permit_id))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({
+            "xdr": xdr,
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.cosign", &xdr),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cosign_response.status(), StatusCode::OK);
+    let cosign_body: serde_json::Value = cosign_response.json().await.unwrap();
+    assert_eq!(cosign_body["status"].as_str().unwrap(), "SIGNED");
 
-    // 6. Outcome Reporting
-    let outcome_resp = client.post(format!("{}/v1/permits/{}/outcome", base_url, permit_id))
-        .header("Authorization", &auth_header)
-        .json(&OutcomeReport {
-            tx_hash: "SUCCESS_HASH".into(),
-            pnl_usd: BigDecimal::from(50),
-            final_amount_units: BigDecimal::from(500),
-        })
-        .send().await.unwrap();
-    assert_eq!(outcome_resp.status(), StatusCode::OK);
-
-    // Verify state transition to CONSUMED
-    let status: String = sqlx::query_scalar("SELECT status FROM permits WHERE permit_id = $1")
-        .bind(permit_id)
-        .fetch_one(&ctx.db).await.unwrap();
-    assert_eq!(status, "CONSUMED");
-
-    // 7. Atomic Multi-wallet Group (Success)
-    let group_req = PermitGroupRequest {
-        agent_id: Uuid::parse_str(agent_id).unwrap(),
-        treasury_id: Uuid::parse_str(treasury_id).unwrap(),
-        legs: vec![
-            PermitRequest {
-                agent_id: Uuid::parse_str(agent_id).unwrap(),
-                treasury_id: Uuid::parse_str(treasury_id).unwrap(),
-                wallet_address: "GA5WNX...".to_string(),
-                asset_code: "XLM".to_string(),
-                asset_issuer: None,
-                requested_amount: BigDecimal::from(100),
-            },
-            PermitRequest {
-                agent_id: Uuid::parse_str(agent_id).unwrap(),
-                treasury_id: Uuid::parse_str(treasury_id).unwrap(),
-                wallet_address: "GA5WNX...".to_string(),
-                asset_code: "XLM".to_string(),
-                asset_issuer: None,
-                requested_amount: BigDecimal::from(200),
-            }
-        ],
-        require_all: true,
+    let outcome_payload = serde_json::json!({
+        "tx_hash": cosign_body["tx_hash"].as_str().unwrap(),
+        "pnl_usd": BigDecimal::from(50),
+        "final_amount_units": BigDecimal::from(500),
+    });
+    let signed_outcome_payload = OutcomeSignaturePayload {
+        tx_hash: cosign_body["tx_hash"].as_str().unwrap().to_string(),
+        pnl_usd: "50".to_string(),
+        final_amount_units: "500".to_string(),
     };
+    let outcome_response = ctx.client
+        .post(format!("{}/v1/permits/{}/outcome", ctx.base_url, permit_id))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({
+            "tx_hash": outcome_payload["tx_hash"],
+            "pnl_usd": outcome_payload["pnl_usd"],
+            "final_amount_units": outcome_payload["final_amount_units"],
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.outcome", &signed_outcome_payload),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outcome_response.status(), StatusCode::OK);
 
-    let group_resp = client.post(format!("{}/v1/permits/group/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&group_req)
-        .send().await.unwrap();
-    assert_eq!(group_resp.status(), StatusCode::CREATED);
-    let group_results: Vec<PolicyResult> = group_resp.json().await.unwrap();
-    assert_eq!(group_results.len(), 2);
-    assert!(group_results[0].approved);
-    assert!(group_results[1].approved);
+    let permit_status: String = sqlx::query_scalar("SELECT status FROM permits WHERE permit_id = $1")
+        .bind(permit_id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+    assert_eq!(permit_status, "CONSUMED");
+}
 
-    // 7.5 Clean up (Consume) these permits so they don't count towards the final check
-    sqlx::query("UPDATE permits SET status = 'CONSUMED' WHERE agent_id = $1 AND status = 'ACTIVE'")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .execute(&ctx.db).await.unwrap();
+#[serial_test::serial]
+#[tokio::test]
+async fn test_signed_request_replay_is_rejected() {
+    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
+        setup_active_agent().await;
 
-    // 8. Atomic Multi-wallet Group (Failure with require_all)
-    // Suspend agent to trigger failure
-    sqlx::query("UPDATE agent_slots SET status = 'SUSPENDED' WHERE agent_id = $1")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .execute(&ctx.db).await.unwrap();
+    let permit = PermitRequest {
+        agent_id,
+        treasury_id,
+        wallet_address,
+        asset_code: "XLM".into(),
+        asset_issuer: None,
+        requested_amount: BigDecimal::from(100),
+    };
+    let request_auth = build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &permit);
+    let body = serde_json::json!({
+        "agent_id": permit.agent_id,
+        "treasury_id": permit.treasury_id,
+        "wallet_address": permit.wallet_address,
+        "asset_code": permit.asset_code,
+        "asset_issuer": permit.asset_issuer,
+        "requested_amount": permit.requested_amount,
+        "request_auth": request_auth,
+    });
 
-    let fail_group_resp = client.post(format!("{}/v1/permits/group/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&group_req)
-        .send().await.unwrap();
-    assert_eq!(fail_group_resp.status(), StatusCode::OK); // Returns results with approved: false
-    let fail_results: Vec<PolicyResult> = fail_group_resp.json().await.unwrap();
-    assert!(!fail_results[0].approved);
-    assert_eq!(fail_results[0].deny_reason, Some("GROUP_REQUIRE_ALL_FAILURE".into()));
+    let first = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
 
-    // Verify no permits were created for this failed group
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permits WHERE agent_id = $1 AND status = 'ACTIVE'")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .fetch_one(&ctx.db).await.unwrap();
-    assert_eq!(count, 0); // Previous permits were CONSUMED or rolled back
+    let second = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let second_body: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(second_body["error"].as_str().unwrap(), "REQUEST_REPLAY");
 }

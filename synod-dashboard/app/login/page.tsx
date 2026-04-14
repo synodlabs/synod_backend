@@ -22,13 +22,13 @@ export default function LoginPage() {
       const res = await fetch("/v1/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ email, password }),
       })
 
       if (!res.ok) throw new Error("Invalid credentials")
 
-      const data = await res.json()
-      localStorage.setItem("synod_token", data.token)
+      // Cookie is set automatically by the backend via Set-Cookie header
       router.push("/dashboard")
     } catch (err: any) {
       setError(err.message)

@@ -17,3 +17,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "aioresponses"]
+
+[project.scripts]
+synod-mcp = "synod.mcp:cli"

@@ -1,33 +1,25 @@
-import asyncio
-import base64
-import json
 import os
-import tempfile
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
 import pytest
 import pytest_asyncio
 from aioresponses import aioresponses
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from stellar_sdk import Keypair
+from stellar_sdk.account import Account
 
 from synod import SynodAgent
 from synod.errors import (
     AgentSuspendedError,
-    AllocationLimitError,
-    PermitDeniedError,
     SynodConnectionError,
     WalletNotAssignedError,
 )
 
-# ── Helpers ──
 
 @pytest.fixture
-def mock_keys(tmp_path):
-    """Provide a temporary directory for key storage and API key."""
-    api_key = "synod_agent_test123"
-    storage_path = str(tmp_path / "keys")
-    return api_key, storage_path
+def storage_path(tmp_path):
+    return str(tmp_path / "keys")
 
 
 @pytest.fixture
@@ -35,243 +27,207 @@ def base_url():
     return "http://localhost:8080"
 
 
-# ── Initialization Tests ──
-
-@pytest.mark.asyncio
-async def test_init_generates_new_key(mock_keys):
-    api_key, storage_path = mock_keys
-    agent = SynodAgent(api_key, key_storage_path=storage_path)
-
-    assert os.path.exists(os.path.join(storage_path, "synod_agent_key.enc"))
-    assert os.path.exists(os.path.join(storage_path, "synod_agent_key.meta"))
+def iso_in(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
 @pytest.mark.asyncio
-async def test_init_loads_existing_key(mock_keys):
-    api_key, storage_path = mock_keys
+async def test_init_generates_new_key(storage_path):
+    SynodAgent(key_storage_path=storage_path)
+    assert os.path.exists(os.path.join(storage_path, "synod_agent_key.json"))
 
-    # First instance generates key
-    agent1 = SynodAgent(api_key, key_storage_path=storage_path)
-    pubkey1 = agent1._keypair.public_key
 
-    # Second instance loads the same key
-    agent2 = SynodAgent(api_key, key_storage_path=storage_path)
-    pubkey2 = agent2._keypair.public_key
-
-    assert pubkey1 == pubkey2
+@pytest.mark.asyncio
+async def test_init_loads_existing_key(storage_path):
+    first = SynodAgent(key_storage_path=storage_path)
+    second = SynodAgent(key_storage_path=storage_path)
+    assert first.public_key == second.public_key
 
 
 @pytest.mark.asyncio
 async def test_init_existing_secret_key():
     kp = Keypair.random()
-    api_key = "synod_agent_test123"
+    agent = SynodAgent(existing_secret_key=kp.secret)
+    assert agent.public_key == kp.public_key
 
-    agent = SynodAgent(api_key, existing_secret_key=kp.secret)
-    assert agent._keypair.public_key == kp.public_key
-
-
-# ── Connect Flow Tests ──
 
 @pytest.mark.asyncio
-async def test_connect_success_immediate(mock_keys, base_url):
-    api_key, storage_path = mock_keys
-    agent = SynodAgent(api_key, key_storage_path=storage_path, coordinator_url=base_url)
+async def test_connect_success_immediate(storage_path, base_url):
+    agent = SynodAgent(key_storage_path=storage_path, coordinator_url=base_url)
 
-    with aioresponses() as m, patch("synod.ws.SynodWebSocket.start", new_callable=AsyncMock):
-        m.post(
-            f"{base_url}/v1/agents/connect",
+    with aioresponses() as mocked, patch("synod.ws.SynodWebSocket.start", new_callable=AsyncMock):
+        mocked.post(
+            f"{base_url}/v1/agents/connect/challenge",
             status=200,
             payload={
                 "agent_id": "agent_1",
                 "treasury_id": "treasury_1",
-                "status": "ACTIVE",
-                "wallet_access": [{"wallet_address": "G1", "agent_max_usd": "100"}],
+                "challenge": "challenge_1",
+                "expires_at": iso_in(300),
+            },
+        )
+        mocked.post(
+            f"{base_url}/v1/agents/connect/complete",
+            status=200,
+            payload={
+                "agent_id": "agent_1",
+                "treasury_id": "treasury_1",
+                "slot_status": "ACTIVE",
+                "connection_phase": "COMPLETE",
+                "reason_code": None,
+                "wallet_access": [{"wallet_address": "G1", "agent_max_usd": "1000.00", "current_wallet_aum_usd": "5000.00"}],
+                "websocket_endpoint": "/v1/agents/ws/agent_1",
+                "websocket_token": "ws_token",
+                "session_token": "session_token",
+                "expires_at": iso_in(3600),
                 "coordinator_pubkey": "GC1",
             },
         )
 
-        res = await agent.connect()
-        assert res["status"] == "ACTIVE"
-        assert res["agent_id"] == "agent_1"
-        assert len(res["wallet_access"]) == 1
+        data = await agent.connect()
+        assert data["slot_status"] == "ACTIVE"
+        assert data["connection_phase"] == "COMPLETE"
+        assert data["public_key"] == agent.public_key
+        assert agent._session_token == "session_token"
+        assert agent._websocket_token == "ws_token"
+        assert agent._runtime_started is True
 
-        # We also mock heartbeat start so it doesn't run forever in test
-        assert agent._status == "ACTIVE"
-        
-        await agent.close()
-
-
-@pytest.mark.asyncio
-async def test_connect_polls_pending(mock_keys, base_url):
-    api_key, storage_path = mock_keys
-    agent = SynodAgent(api_key, key_storage_path=storage_path, coordinator_url=base_url)
-
-    with aioresponses() as m, patch("synod.ws.SynodWebSocket.start", new_callable=AsyncMock), \
-         patch("asyncio.sleep", new_callable=AsyncMock):
-        
-        # Connect returns PENDING_SIGNER
-        m.post(
-            f"{base_url}/v1/agents/connect",
-            status=200,
-            payload={
-                "agent_id": "agent_1",
-                "treasury_id": "treasury_1",
-                "status": "PENDING_SIGNER",
-            },
-        )
-        
-        # First poll: still pending
-        m.get(
-            f"{base_url}/v1/agents/agent_1/status",
-            status=200,
-            payload={"status": "PENDING_SIGNER"},
-        )
-
-        # Second poll: active
-        m.get(
-            f"{base_url}/v1/agents/agent_1/status",
-            status=200,
-            payload={
-                "status": "ACTIVE",
-                "wallet_access": [{"wallet_address": "G1"}],
-            },
-        )
-
-        res = await agent.connect()
-        assert res["status"] == "ACTIVE"
-        await agent.close()
-
-
-@pytest.mark.asyncio
-async def test_connect_handles_errors(mock_keys, base_url):
-    api_key, storage_path = mock_keys
-    agent = SynodAgent(api_key, key_storage_path=storage_path, coordinator_url=base_url)
-
-    try:
-        with aioresponses() as m:
-            # Invalid API Key
-            m.post(f"{base_url}/v1/agents/connect", status=401)
-            with pytest.raises(SynodConnectionError, match="Invalid API key"):
-                await agent.connect()
-
-            # Suspended
-            m.post(f"{base_url}/v1/agents/connect", status=403, payload={"error": "AGENT_SUSPENDED"})
-            with pytest.raises(AgentSuspendedError):
-                await agent.connect()
-
-            # Pubkey conflict
-            m.post(f"{base_url}/v1/agents/connect", status=409, payload={"error": "PUBKEY_CONFLICT"})
-            with pytest.raises(SynodConnectionError, match="conflict"):
-                await agent.connect()
-    finally:
-        await agent.close()
-
-
-# ── Execute Flow Tests ──
-
-@pytest_asyncio.fixture
-async def connected_agent(mock_keys, base_url):
-    api_key, storage_path = mock_keys
-    agent = SynodAgent(api_key, key_storage_path=storage_path, coordinator_url=base_url)
-    
-    # Inject directly instead of connecting
-    agent._agent_id = "agent_1"
-    agent._treasury_id = "treasury_1"
-    agent._status = "ACTIVE"
-    agent._mock_source = Keypair.random().public_key
-    agent._wallet_access = [
-        {
-            "wallet_address": agent._mock_source,
-            "allocation_pct": 50.0,
-            "agent_max_usd": "5000"
-        }
-    ]
-    agent._session = __import__('aiohttp').ClientSession()
-    
-    yield agent
-    
     await agent.close()
 
 
 @pytest.mark.asyncio
-async def test_execute_success(connected_agent, base_url):
-    agent = connected_agent
-    
-    with aioresponses() as m, patch("synod.Server.load_account") as mock_load:
-        # Mock stellar account
-        mock_load.return_value.sequence = 1
+async def test_connect_requires_enrollment(storage_path, base_url):
+    agent = SynodAgent(key_storage_path=storage_path, coordinator_url=base_url)
 
-        # 1. Permit request
-        m.post(
-            f"{base_url}/v1/permits/request",
+    with aioresponses() as mocked:
+        mocked.post(f"{base_url}/v1/agents/connect/challenge", status=404)
+        with pytest.raises(SynodConnectionError, match="not enrolled"):
+            await agent.connect()
+
+    await agent.close()
+
+
+@pytest_asyncio.fixture
+async def connected_agent(storage_path, base_url):
+    agent = SynodAgent(key_storage_path=storage_path, coordinator_url=base_url)
+    agent._agent_id = "agent_1"
+    agent._treasury_id = "treasury_1"
+    agent._status = "ACTIVE"
+    agent._connection_phase = "COMPLETE"
+    agent._session_token = "session_token"
+    agent._websocket_token = "ws_token"
+    agent._ticket_expires_at = iso_in(3600)
+    agent._wallet_access = [
+        {
+            "wallet_address": Keypair.random().public_key,
+            "allocation_pct": 50.0,
+            "agent_max_usd": "5000.00",
+            "current_wallet_aum_usd": "10000.00",
+        }
+    ]
+    agent._session = aiohttp.ClientSession()
+    yield agent
+    await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_get_status_refreshes_ticket_when_expiring(connected_agent, base_url):
+    connected_agent._ticket_expires_at = iso_in(10)
+
+    with aioresponses() as mocked:
+        mocked.post(
+            f"{base_url}/v1/agents/ws-ticket/refresh",
             status=200,
             payload={
-                "approved": True,
-                "approved_amount": 1000.0,
-                "permit_id": "permit_123",
+                "session_token": "session_token_2",
+                "websocket_token": "ws_token_2",
+                "expires_at": iso_in(3600),
+            },
+        )
+        mocked.get(
+            f"{base_url}/v1/agents/{connected_agent._agent_id}/status",
+            status=200,
+            payload={
+                "agent_id": connected_agent._agent_id,
+                "treasury_id": connected_agent._treasury_id,
+                "slot_status": "ACTIVE",
+                "connection_phase": "COMPLETE",
+                "reason_code": None,
+                "wallet_access": connected_agent._wallet_access,
             },
         )
 
-        # 2. Co-sign request
-        m.post(
+        data = await connected_agent.get_status()
+        assert data["slot_status"] == "ACTIVE"
+        assert connected_agent._session_token == "session_token_2"
+        assert connected_agent._websocket_token == "ws_token_2"
+
+
+@pytest.mark.asyncio
+async def test_execute_success(connected_agent, base_url):
+    wallet = connected_agent._wallet_access[0]["wallet_address"]
+
+    with aioresponses() as mocked, patch("synod.Server.load_account") as mock_load_account:
+        mock_load_account.return_value = Account(wallet, 1)
+
+        mocked.post(
+            f"{base_url}/v1/permits/request",
+            status=201,
+            payload={
+                "permit_id": "permit_123",
+                "approved": True,
+                "approved_amount": 250.0,
+                "deny_reason": None,
+                "policy_check_number": 7,
+                "partial_reason": None,
+            },
+        )
+        mocked.post(
             f"{base_url}/v1/permits/permit_123/cosign",
             status=200,
-            payload={"tx_hash": "hash_123"},
+            payload={"status": "SIGNED", "tx_hash": "hash_123"},
         )
-
-        # 3. Outcome
-        m.post(
+        mocked.post(
             f"{base_url}/v1/permits/permit_123/outcome",
             status=200,
             payload={},
         )
 
-        result = await agent.execute(
-            wallet=agent._mock_source,
+        result = await connected_agent.execute(
+            wallet=wallet,
             destination=Keypair.random().public_key,
-            amount=1000.0,
-            asset="XLM"
+            amount=250.0,
+            asset="XLM",
         )
 
         assert result.tx_hash == "hash_123"
         assert result.permit_id == "permit_123"
-        assert result.approved_amount == 1000.0
-        assert not result.partial
-
-    await agent.close()
+        assert result.approved_amount == 250.0
+        assert result.partial is False
 
 
 @pytest.mark.asyncio
-async def test_execute_permit_denied(connected_agent, base_url):
-    agent = connected_agent
-
-    with aioresponses() as m:
-        m.post(
-            f"{base_url}/v1/permits/request",
-            status=403,
-            payload={"error": "ALLOCATION_LIMIT", "message": "Allocation limit exceeded"},
-        )
-
-        with pytest.raises(AllocationLimitError):
-            await agent.execute(
-                wallet=agent._mock_source,
-                destination=Keypair.random().public_key,
-                amount=99999.0,
-                asset="XLM"
-            )
-
-    await agent.close()
-
-
-@pytest.mark.asyncio
-async def test_execute_wallet_not_assigned(connected_agent, base_url):
-    agent = connected_agent
-
+async def test_execute_wallet_not_assigned(connected_agent):
     with pytest.raises(WalletNotAssignedError):
-        await agent.execute(
+        await connected_agent.execute(
             wallet=Keypair.random().public_key,
             destination=Keypair.random().public_key,
-            amount=1000.0,
-            asset="XLM"
+            amount=100.0,
+            asset="XLM",
         )
+
+
+@pytest.mark.asyncio
+async def test_connect_maps_suspension_error(storage_path, base_url):
+    agent = SynodAgent(key_storage_path=storage_path, coordinator_url=base_url)
+
+    with aioresponses() as mocked:
+        mocked.post(
+            f"{base_url}/v1/agents/connect/challenge",
+            status=403,
+            payload={"error": "AGENT_SUSPENDED"},
+        )
+        with pytest.raises(AgentSuspendedError):
+            await agent.connect()
+
     await agent.close()

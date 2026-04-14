@@ -3,6 +3,7 @@ use serde_json::json;
 mod common;
 use common::{spawn_test_server, generate_test_stellar_keypair, sign_with_key};
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_phase_3_wallet_flow() {
     let base_url = spawn_test_server().await;

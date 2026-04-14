@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import { useRouter } from "next/navigation"
-import { Shield, Lock, Mail, ArrowRight, UserPlus } from "lucide-react"
+import { Lock, Mail, ArrowRight, UserPlus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 
@@ -28,6 +28,7 @@ export default function SignupPage() {
       const res = await fetch("/v1/auth/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ email, password }),
       })
 
@@ -36,8 +37,7 @@ export default function SignupPage() {
         throw new Error(data.message || "Registration failed")
       }
 
-      const data = await res.json()
-      localStorage.setItem("synod_token", data.token)
+      // Cookie is set automatically by the backend via Set-Cookie header
       router.push("/dashboard")
     } catch (err: any) {
       setError(err.message)

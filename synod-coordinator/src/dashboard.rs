@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::error::{AppResult, AppError};
 use crate::AppState;
 use crate::auth::AuthUser;
+use crate::resync::WalletBalance;
 use sqlx::Row;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,8 +29,17 @@ pub struct DashboardTreasuryState {
     pub current_aum_usd: f64,
     pub peak_aum_usd: f64,
     pub constitution_version: i32,
-    pub pools: serde_json::Value,
+    pub active_permit_count: i64,
+    pub max_drawdown_pct: f64,
+    pub drawdown_current_pct: f64,
     pub wallets: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardBalances {
+    pub treasury_id: Uuid,
+    pub balances: Vec<WalletBalance>,
+    pub total_aum_usd: f64,
 }
 
 pub async fn list_treasuries(
@@ -69,9 +79,27 @@ pub async fn get_treasury_state(
     .await?
     .ok_or(AppError::TreasuryNotFound)?;
 
-    let pools = row.get::<Option<serde_json::Value>, _>(7)
-        .and_then(|v| v.get("pools").cloned())
-        .unwrap_or(serde_json::Value::Array(vec![]));
+    // Active permit count
+    let active_permit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM permits WHERE treasury_id = $1 AND status = 'ACTIVE'"
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await?;
+
+    // Drawdown calculation
+    let peak_aum: f64 = row.get(5);
+    let current_aum: f64 = row.get(4);
+    let drawdown_current_pct = if peak_aum > 0.0 {
+        ((peak_aum - current_aum) / peak_aum * 100.0).max(0.0)
+    } else {
+        0.0
+    };
+
+    // Max drawdown from constitution
+    let max_drawdown_pct = row.get::<Option<serde_json::Value>, _>(7)
+        .and_then(|v| v.get("treasury_rules").and_then(|tr| tr.get("max_drawdown_pct")).and_then(|d| d.as_f64()))
+        .unwrap_or(20.0);
 
     let wallets = sqlx::query(
         "SELECT wallet_address, label, multisig_active, status FROM treasury_wallets WHERE treasury_id = $1"
@@ -94,11 +122,42 @@ pub async fn get_treasury_state(
         name: row.get(1),
         network: row.get(2),
         health: row.get(3),
-        current_aum_usd: row.get(4),
-        peak_aum_usd: row.get(5),
+        current_aum_usd: current_aum,
+        peak_aum_usd: peak_aum,
         constitution_version: row.get(6),
-        pools,
+        active_permit_count,
+        max_drawdown_pct,
+        drawdown_current_pct,
         wallets: wallets_json,
+    }))
+}
+
+/// Return cached balance snapshot for a treasury's wallets
+pub async fn get_treasury_balances(
+    State(state): State<AppState>,
+    _auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<DashboardBalances>> {
+    use redis::AsyncCommands;
+    let mut redis = state.redis.clone();
+
+    let snapshot_key = format!("treasury:snapshot:{}", id);
+    let cached: Option<String> = redis.get(&snapshot_key).await.unwrap_or(None);
+
+    let (balances, total_aum) = if let Some(json_str) = cached {
+        let balances: Vec<WalletBalance> = serde_json::from_str(&json_str).unwrap_or_default();
+        let total: f64 = balances.iter().map(|b| b.usd_value).sum();
+        (balances, total)
+    } else {
+        // Trigger a fresh resync if no cached data
+        let result = crate::resync::resync_treasury(id, &state).await?;
+        (result.balances, result.total_aum_usd)
+    };
+
+    Ok(Json(DashboardBalances {
+        treasury_id: id,
+        balances,
+        total_aum_usd: total_aum,
     }))
 }
 
@@ -113,11 +172,10 @@ pub async fn ws_handler(
 async fn handle_socket(mut socket: WebSocket, state: AppState, _auth: AuthUser) {
     let mut rx = state.tx_events.subscribe();
     
-    // In a real app we'd filter events to only those the user is authorized for.
-    // For this prototype we push all events (assuming user owns all for simplicity in test).
-
     while let Ok(event) = rx.recv().await {
-        let msg = serde_json::to_string(&event).unwrap();
+        // Send unified EventEnvelope format
+        let envelope = event.to_envelope();
+        let msg = serde_json::to_string(&envelope).unwrap();
         if socket.send(Message::Text(msg)).await.is_err() {
             break;
         }
@@ -128,5 +186,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_treasuries))
         .route("/:id", get(get_treasury_state))
+        .route("/:id/balances", get(get_treasury_balances))
         .route("/ws", get(ws_handler))
 }

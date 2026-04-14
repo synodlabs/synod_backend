@@ -1,5 +1,4 @@
-use std::convert::TryInto;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use data_encoding::BASE32_NOPAD;
 
 fn main() {

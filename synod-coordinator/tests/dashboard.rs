@@ -1,15 +1,12 @@
 use reqwest::StatusCode;
 use uuid::Uuid;
-use synod_shared::models::*;
-use crate::common::{setup_test_context, TestContext};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures::{StreamExt, SinkExt};
-use synod_coordinator::TreasuryEvent;
-use sqlx::Executor;
+use crate::common::setup_test_context;
+use tokio_tungstenite::connect_async;
 use http::Request;
 
 mod common;
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_phase_10_dashboard_and_ws() {
     let ctx = setup_test_context().await;
@@ -75,15 +72,7 @@ async fn test_phase_10_dashboard_and_ws() {
         .body(())
         .unwrap();
 
-    let (mut ws_stream, _) = connect_async(request).await.expect("Failed to connect to WS");
+    let (_ws_stream, _) = connect_async(request).await.expect("Failed to connect to WS");
 
-    // 6. Broadcast an Event
-    let _event = TreasuryEvent::WalletBalanceUpdate {
-        treasury_id: treasury_uuid,
-        wallet_address: "stellar_wallet".to_string(),
-        amount: 55000.0,
-        asset_code: "XLM".to_string(),
-    };
-    // No easy way to trigger broadcast in this test context without hitting a real endpoint.
-    // For now we just verify the WS handshake was successful.
+    // 6. WS handshake success is enough for this integration test.
 }

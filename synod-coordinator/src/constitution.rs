@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, State};
-use axum::{routing::{get, post, put}, Json, Router};
+use axum::{routing::{get, post}, Json, Router};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};

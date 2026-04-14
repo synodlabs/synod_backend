@@ -1,5 +1,6 @@
 use redis::AsyncCommands;
 
+#[serial_test::serial]
 #[tokio::test]
 async fn redis_connection_works() {
     dotenvy::dotenv().ok();
@@ -28,6 +29,7 @@ async fn redis_connection_works() {
         .expect("Failed to DEL test key");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn redis_connection_manager_pooling() {
     dotenvy::dotenv().ok();

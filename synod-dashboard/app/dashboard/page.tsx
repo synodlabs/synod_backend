@@ -512,7 +512,7 @@ function PoolItem({ pool }: { pool: Pool }) {
   )
 }
 
-function EventRow({ event }: { event: DashboardEvent }) {
+function EventRow({ event }: { event: any }) {
   const typeStr = event?.event_type || event?.type || (typeof event === 'object' ? Object.keys(event)[0] : "EVENT");
   const payloadStr = event?.payload ? JSON.stringify(event.payload) : JSON.stringify(event);
 

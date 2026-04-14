@@ -9,7 +9,7 @@ use sqlx::Row;
 
 use crate::AppState;
 use crate::error::{AppError, AppResult};
-use crate::auth::AgentAuth;
+use crate::auth::{AgentAuth, SignedRequestAuth, verify_signed_request};
 use crate::constitution::{normalize_constitution_value, AgentWalletRule as CoordinatorAgentWalletRule};
 use crate::policy::run_policy_engine;
 use synod_shared::models::*;
@@ -20,6 +20,20 @@ pub struct PermitGroupRequest {
     pub treasury_id: Uuid,
     pub legs: Vec<PermitRequest>,
     pub require_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedPermitRequest {
+    #[serde(flatten)]
+    pub permit: PermitRequest,
+    pub request_auth: SignedRequestAuth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedPermitGroupRequest {
+    #[serde(flatten)]
+    pub group: PermitGroupRequest,
+    pub request_auth: SignedRequestAuth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,30 +54,31 @@ pub fn router() -> Router<AppState> {
 pub async fn request_permit(
     State(state): State<AppState>,
     agent_auth: AgentAuth,
-    Json(payload): Json<PermitRequest>,
+    Json(payload): Json<SignedPermitRequest>,
 ) -> AppResult<(StatusCode, Json<PermitDecisionResponse>)> {
-    info!("Handling permit request for agent: {}", payload.agent_id);
-    if payload.agent_id != agent_auth.agent_id || payload.treasury_id != agent_auth.treasury_id {
-        return Err(AppError::InvalidApiKey);
+    info!("Handling permit request for agent: {}", payload.permit.agent_id);
+    if payload.permit.agent_id != agent_auth.agent_id || payload.permit.treasury_id != agent_auth.treasury_id {
+        return Err(AppError::InvalidAgentSession);
     }
+    verify_signed_request(&state, &agent_auth, "permit.request", &payload.permit, &payload.request_auth).await?;
     let mut tx = state.db.begin().await?;
     
     let group_id = Uuid::new_v4();
-    let requested_usd = payload.requested_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let requested_usd = payload.permit.requested_amount.to_string().parse::<f64>().unwrap_or(0.0);
     
     sqlx::query(
         r#"INSERT INTO permit_groups (group_id, agent_id, treasury_id, total_requested_usd, total_approved_usd, status, expires_at)
            VALUES ($1, $2, $3, $4, $5, 'PENDING', $6)"#
     )
     .bind(group_id)
-    .bind(payload.agent_id)
-    .bind(payload.treasury_id)
+    .bind(payload.permit.agent_id)
+    .bind(payload.permit.treasury_id)
     .bind(requested_usd)
     .bind(0.0)
     .bind(Utc::now() + Duration::hours(1))
     .execute(&mut *tx).await?;
 
-    let (result, permit_id) = process_single_permit(&mut tx, &state, &payload, group_id, Uuid::new_v4()).await?;
+    let (result, permit_id) = process_single_permit(&mut tx, &state, &payload.permit, group_id, Uuid::new_v4()).await?;
     
     // Update group status if approved/denied immediately
     let group_status = if result.approved { "ACTIVE" } else { "DENIED" };
@@ -81,18 +96,19 @@ pub async fn request_permit(
 pub async fn request_permit_group(
     State(state): State<AppState>,
     agent_auth: AgentAuth,
-    Json(payload): Json<PermitGroupRequest>,
+    Json(payload): Json<SignedPermitGroupRequest>,
 ) -> AppResult<(StatusCode, Json<Vec<PolicyResult>>)> {
-    if payload.agent_id != agent_auth.agent_id || payload.treasury_id != agent_auth.treasury_id {
-        return Err(AppError::InvalidApiKey);
+    if payload.group.agent_id != agent_auth.agent_id || payload.group.treasury_id != agent_auth.treasury_id {
+        return Err(AppError::InvalidAgentSession);
     }
+    verify_signed_request(&state, &agent_auth, "permit.group_request", &payload.group, &payload.request_auth).await?;
     let mut tx = state.db.begin().await?;
     let group_id = Uuid::new_v4();
     let mut results = Vec::new();
     let mut total_requested = 0.0;
     
     // 1. Sort legs for deadlock prevention (alphabetical by wallet)
-    let mut sorted_legs = payload.legs.clone();
+    let mut sorted_legs = payload.group.legs.clone();
     sorted_legs.sort_by(|a, b| a.wallet_address.cmp(&b.wallet_address));
 
     // 2. Create Group record first to satisfy FK
@@ -101,9 +117,9 @@ pub async fn request_permit_group(
          VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', $7)"
     )
     .bind(group_id)
-    .bind(payload.agent_id)
-    .bind(payload.treasury_id)
-    .bind(payload.require_all)
+    .bind(payload.group.agent_id)
+    .bind(payload.group.treasury_id)
+    .bind(payload.group.require_all)
     .bind(0.0) // Initial
     .bind(0.0) // Initial
     .bind(Utc::now() + Duration::hours(1))
@@ -122,7 +138,7 @@ pub async fn request_permit_group(
     }
 
     // 4. Apply require_all logic
-    if payload.require_all && any_denied {
+    if payload.group.require_all && any_denied {
         tx.rollback().await?;
         // Update results to show all denied
         for res in &mut results {
@@ -148,6 +164,7 @@ pub async fn request_permit_group(
 #[derive(Deserialize)]
 pub struct CosignRequest {
     pub xdr: String, // Stellar Transaction Envelope XDR
+    pub request_auth: SignedRequestAuth,
 }
 
 pub async fn cosign_permit(
@@ -165,40 +182,121 @@ pub async fn cosign_permit(
     .ok_or(AppError::NotFound("Active permit not found".into()))?;
 
     if permit.get::<Uuid, _>("agent_id") != agent_auth.agent_id {
-        return Err(AppError::InvalidApiKey);
+        return Err(AppError::InvalidAgentSession);
+    }
+    verify_signed_request(&state, &agent_auth, "permit.cosign", &payload.xdr, &payload.request_auth).await?;
+
+    let _permit_wallet: String = permit.get("wallet_address");
+    let permit_asset: String = permit.get("asset_code");
+    let permit_amount: f64 = permit.get("approved_amount");
+
+    // 2. Decode and Verify XDR Envelope
+    use stellar_xdr::curr::{TransactionEnvelope, ReadXdr, Limits};
+
+    let xdr_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &payload.xdr,
+    ).map_err(|_| AppError::CosignFailed("Invalid XDR base64 encoding".into()))?;
+
+    let envelope = TransactionEnvelope::from_xdr(xdr_bytes.clone(), Limits::none())
+        .map_err(|e| AppError::CosignFailed(format!("XDR decode failed: {}", e)))?;
+
+    // Extract the transaction body and validate operations
+    let ops = match &envelope {
+        TransactionEnvelope::Tx(v1) => &v1.tx.operations,
+        TransactionEnvelope::TxV0(v0) => &v0.tx.operations,
+        _ => return Err(AppError::CosignFailed("Unsupported envelope type".into())),
+    };
+
+    if ops.is_empty() {
+        return Err(AppError::CosignFailed("Transaction has no operations".into()));
     }
 
-    // 2. Verify Intent (Destination, Amount, Asset)
-    // Simplified verification for the test gate:
-    // In a real system, we'd use stellar_xdr to decode payload.xdr and check:
-    // tx.operations[0].destination == permit.wallet_address
-    // tx.operations[0].amount == permit.approved_amount
-    
-    info!("Co-signing permit {} for XDR: {}", permit_id, payload.xdr);
+    // Verify first operation is a payment matching the permit
+    let op = &ops[0];
+    match &op.body {
+        stellar_xdr::curr::OperationBody::Payment(payment) => {
+            // Verify asset
+            let tx_asset = match &payment.asset {
+                stellar_xdr::curr::Asset::Native => "XLM".to_string(),
+                stellar_xdr::curr::Asset::CreditAlphanum4(a4) => {
+                    String::from_utf8_lossy(&a4.asset_code.0).trim_end_matches('\0').to_string()
+                }
+                stellar_xdr::curr::Asset::CreditAlphanum12(a12) => {
+                    String::from_utf8_lossy(&a12.asset_code.0).trim_end_matches('\0').to_string()
+                }
+            };
 
-    // DUMMY XDR VALIDATION for Test Gate:
-    // If XDR contains "INVALID", we reject it.
-    if payload.xdr.contains("INVALID") {
-        return Err(AppError::InvalidInput("Transaction destination or amount mismatch".into()));
+            // The amount in XDR is in stroops (1 XLM = 10_000_000 stroops)
+            let tx_amount_stroops: i64 = payment.amount;
+            let tx_amount = tx_amount_stroops as f64 / 10_000_000.0;
+
+            // Allow 0.01 tolerance for floating point
+            let amount_diff = (tx_amount - permit_amount).abs();
+            if amount_diff > 0.01 {
+                return Err(AppError::CosignFailed(format!(
+                    "Amount mismatch: tx={:.7} permit={:.7}", tx_amount, permit_amount
+                )));
+            }
+
+            if tx_asset != permit_asset {
+                return Err(AppError::CosignFailed(format!(
+                    "Asset mismatch: tx={} permit={}", tx_asset, permit_asset
+                )));
+            }
+
+            info!(
+                permit = %permit_id,
+                amount = %tx_amount,
+                asset = %tx_asset,
+                "Permit intent verified, co-signing"
+            );
+        }
+        _ => {
+            return Err(AppError::CosignFailed("First operation must be a Payment".into()));
+        }
     }
 
     // 3. Coordinator Signs (Shard 2)
-    // We append our shard's signature here.
-    let signature = "COORD_SHARD_2_SIG_BASE64";
+    let coordinator_secret = &state.config.stellar.coordinator_secret_key;
+    if coordinator_secret.is_empty() {
+        return Err(AppError::CosignFailed("Coordinator secret key not configured".into()));
+    }
+
+    let signature = crate::stellar::sign_transaction_hash(
+        coordinator_secret,
+        &state.config.stellar.network_passphrase,
+        &payload.xdr,
+    )?;
+
+    // Compute transaction hash for tracking
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(&xdr_bytes);
+    let tx_hash = hex::encode(hasher.finalize());
 
     Ok(Json(serde_json::json!({
         "status": "SIGNED",
         "permit_id": permit_id,
         "signature": signature,
-        "tx_hash": "COORD_STAMPED_HASH"
+        "tx_hash": tx_hash
     })))
 }
+
 
 #[derive(Serialize, Deserialize)]
 pub struct OutcomeReport {
     pub tx_hash: String,
     pub pnl_usd: BigDecimal,
     pub final_amount_units: BigDecimal,
+    pub request_auth: SignedRequestAuth,
+}
+
+#[derive(Serialize)]
+struct OutcomeReportSignaturePayload {
+    tx_hash: String,
+    pnl_usd: String,
+    final_amount_units: String,
 }
 
 pub async fn report_outcome(
@@ -223,8 +321,14 @@ pub async fn report_outcome(
     let treasury_id: Uuid = treasury_info.get("treasury_id");
     let permit_agent_id: Uuid = treasury_info.get("agent_id");
     if permit_agent_id != agent_auth.agent_id {
-        return Err(AppError::InvalidApiKey);
+        return Err(AppError::InvalidAgentSession);
     }
+    let signature_payload = OutcomeReportSignaturePayload {
+        tx_hash: payload.tx_hash.clone(),
+        pnl_usd: payload.pnl_usd.to_string(),
+        final_amount_units: payload.final_amount_units.to_string(),
+    };
+    verify_signed_request(&state, &agent_auth, "permit.outcome", &signature_payload, &payload.request_auth).await?;
     let peak_aum: f64 = treasury_info.get("peak_aum_usd");
     let current_aum: f64 = treasury_info.get("current_aum_usd");
     let content_json: serde_json::Value = treasury_info.get("content");

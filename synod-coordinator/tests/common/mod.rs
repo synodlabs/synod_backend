@@ -1,7 +1,8 @@
 use synod_coordinator::config::Settings;
 use sqlx::postgres::PgPoolOptions;
-use synod_coordinator::{AppState, auth::AuthUser};
+use synod_coordinator::AppState;
 use redis::aio::ConnectionManager;
+use serde::Serialize;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -83,6 +84,7 @@ pub async fn spawn_test_server() -> String {
     format!("http://{}", addr)
 }
 
+#[allow(dead_code)]
 pub fn generate_test_stellar_keypair() -> (ed25519_dalek::SigningKey, String) {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -99,6 +101,7 @@ pub fn generate_test_stellar_keypair() -> (ed25519_dalek::SigningKey, String) {
     (signing_key, pk_stellar)
 }
 
+#[allow(dead_code)]
 pub fn sign_with_key(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) -> String {
     use ed25519_dalek::Signer;
     use sha2::{Sha256, Digest};
@@ -110,6 +113,7 @@ pub fn sign_with_key(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) ->
     let signature = signing_key.sign(&hashed);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes())
 }
+#[allow(dead_code)]
 pub struct TestContext {
     pub base_url: String,
     pub client: reqwest::Client,
@@ -117,6 +121,7 @@ pub struct TestContext {
     pub user_token: String,
 }
 
+#[allow(dead_code)]
 pub async fn setup_test_context() -> TestContext {
     let base_url = spawn_test_server().await;
     let client = reqwest::Client::new();
@@ -144,4 +149,167 @@ pub async fn setup_test_context() -> TestContext {
         db,
         user_token: token,
     }
+}
+
+#[allow(dead_code)]
+pub async fn create_treasury(ctx: &TestContext, name: &str) -> Uuid {
+    let response = ctx.client
+        .post(format!("{}/v1/treasuries", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .json(&serde_json::json!({ "name": name, "network": "testnet" }))
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    Uuid::parse_str(body["treasury_id"].as_str().unwrap()).unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn attach_active_wallet(ctx: &TestContext, treasury_id: Uuid, wallet_address: &str) {
+    sqlx::query(
+        "INSERT INTO treasury_wallets (wallet_id, treasury_id, wallet_address, label, multisig_active, status, added_at)
+         VALUES ($1, $2, $3, 'Test Wallet', false, 'ACTIVE', NOW())
+         ON CONFLICT (treasury_id, wallet_address) DO UPDATE SET status = 'ACTIVE'"
+    )
+    .bind(Uuid::new_v4())
+    .bind(treasury_id)
+    .bind(wallet_address)
+    .execute(&ctx.db)
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE treasuries SET health = 'HEALTHY', updated_at = NOW() WHERE treasury_id = $1")
+        .bind(treasury_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+}
+
+#[allow(dead_code)]
+pub async fn create_agent_slot(ctx: &TestContext, treasury_id: Uuid, name: &str) -> Uuid {
+    let response = ctx.client
+        .post(format!("{}/v1/agents/{}", ctx.base_url, treasury_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .json(&serde_json::json!({ "name": name, "description": "Integration test agent" }))
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    Uuid::parse_str(body["agent"]["agent_id"].as_str().unwrap()).unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn enroll_agent_pubkey(
+    ctx: &TestContext,
+    agent_id: Uuid,
+    wallet_address: &str,
+    wallet_signing_key: &ed25519_dalek::SigningKey,
+    agent_pubkey: &str,
+) -> serde_json::Value {
+    let challenge_response = ctx.client
+        .post(format!("{}/v1/agents/{}/enroll/challenge", ctx.base_url, agent_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .json(&serde_json::json!({
+            "wallet_address": wallet_address,
+            "agent_pubkey": agent_pubkey,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let challenge_body: serde_json::Value = challenge_response.json().await.unwrap();
+    let challenge = challenge_body["challenge"].as_str().unwrap();
+    let message = format!(
+        "synod-enroll:{}:{}:{}:{}",
+        agent_id,
+        wallet_address,
+        agent_pubkey,
+        challenge
+    );
+    let signature = sign_with_key(wallet_signing_key, message.as_bytes());
+
+    let enroll_response = ctx.client
+        .post(format!("{}/v1/agents/{}/enroll-pubkey", ctx.base_url, agent_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .json(&serde_json::json!({
+            "wallet_address": wallet_address,
+            "agent_pubkey": agent_pubkey,
+            "challenge": challenge,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    enroll_response.json().await.unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn connect_agent(
+    ctx: &TestContext,
+    agent_pubkey: &str,
+    agent_signing_key: &ed25519_dalek::SigningKey,
+) -> serde_json::Value {
+    let challenge_response = ctx.client
+        .post(format!("{}/v1/agents/connect/challenge", ctx.base_url))
+        .json(&serde_json::json!({ "agent_pubkey": agent_pubkey }))
+        .send()
+        .await
+        .unwrap();
+
+    let challenge_body: serde_json::Value = challenge_response.json().await.unwrap();
+    let agent_id = challenge_body["agent_id"].as_str().unwrap();
+    let treasury_id = challenge_body["treasury_id"].as_str().unwrap();
+    let challenge = challenge_body["challenge"].as_str().unwrap();
+    let message = format!(
+        "synod-connect:{}:{}:{}:{}",
+        agent_id,
+        treasury_id,
+        agent_pubkey,
+        challenge
+    );
+    let signature = sign_with_key(agent_signing_key, message.as_bytes());
+
+    let connect_response = ctx.client
+        .post(format!("{}/v1/agents/connect/complete", ctx.base_url))
+        .json(&serde_json::json!({
+            "agent_pubkey": agent_pubkey,
+            "challenge": challenge,
+            "signature": signature,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    connect_response.json().await.unwrap()
+}
+
+#[allow(dead_code)]
+pub fn build_signed_request_auth<T: Serialize>(
+    signing_key: &ed25519_dalek::SigningKey,
+    agent_pubkey: &str,
+    agent_id: Uuid,
+    op_name: &str,
+    payload: &T,
+) -> serde_json::Value {
+    let request_id = Uuid::new_v4().to_string();
+    let timestamp = chrono::Utc::now().timestamp();
+    let payload_json = serde_json::to_string(payload).unwrap();
+    let message = format!(
+        "synod-request:{}:{}:{}:{}:{}",
+        op_name,
+        agent_id,
+        request_id,
+        timestamp,
+        payload_json
+    );
+
+    serde_json::json!({
+        "agent_pubkey": agent_pubkey,
+        "request_id": request_id,
+        "timestamp": timestamp,
+        "signature": sign_with_key(signing_key, message.as_bytes()),
+    })
 }

@@ -8,6 +8,7 @@ mod common;
 use common::{spawn_test_server, generate_test_stellar_keypair, sign_with_key};
 use synod_coordinator::constitution::{AgentWalletRule, ConstitutionContent, TreasuryRules};
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_phase_5_constitution_flow() {
     let base_url = spawn_test_server().await;
@@ -145,6 +146,7 @@ async fn test_phase_5_constitution_flow() {
     assert_eq!(state_hash_v1, state_hash_v2); // State matches exactly!
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_phase_5_governance_signing() {
     let base_url = spawn_test_server().await;

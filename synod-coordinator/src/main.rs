@@ -1,9 +1,12 @@
 use synod_coordinator::config::Settings;
-use synod_coordinator::{config, AppState};
+use synod_coordinator::{config, AppState, WatcherHandles};
 use redis::aio::ConnectionManager;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 use dotenvy::dotenv;
@@ -24,7 +27,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Load typed configuration
     let settings = Settings::load().unwrap_or_else(|e| {
-        // Fallback to env vars if config file not found
         tracing::warn!("Config file not found, falling back to env vars: {}", e);
         Settings {
             server: config::ServerConfig::default(),
@@ -78,11 +80,14 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx_events, _) = tokio::sync::broadcast::channel(100);
 
+    let watcher_handles: WatcherHandles = Arc::new(Mutex::new(HashMap::new()));
+
     let state = AppState {
         db: db_pool,
         redis: redis_manager,
         config: settings.clone(),
         tx_events,
+        watcher_handles,
     };
 
     let app = synod_coordinator::router(state.clone());
@@ -94,9 +99,12 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            if let Err(e) = sqlx::query!(
+            if let Err(e) = sqlx::query(
                 "UPDATE permits SET status = 'EXPIRED' WHERE status = 'ACTIVE' AND expires_at < NOW()"
-            ).execute(&db_pool_clone).await {
+            )
+            .execute(&db_pool_clone)
+            .await
+            {
                 tracing::error!("Failed to expire permits: {}", e);
             }
         }
@@ -110,7 +118,6 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
         loop {
             interval.tick().await;
-            // Flip agents to INACTIVE if no heartbeat for 10 minutes
             match sqlx::query(
                 "UPDATE agent_slots SET status = 'INACTIVE' WHERE status = 'ACTIVE' AND last_connected < NOW() - INTERVAL '10 minutes' RETURNING agent_id, treasury_id"
             )
@@ -132,6 +139,20 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("Failed to check agent heartbeats: {}", e);
                 }
             }
+        }
+    });
+
+    // Spawn Horizon Watchers for all active wallets
+    synod_coordinator::horizon::spawn_watchers(state.clone()).await;
+
+    // Spawn 6-hour scheduled reconciliation
+    let recon_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            synod_coordinator::resync::scheduled_reconciliation(recon_state.clone()).await;
         }
     });
 

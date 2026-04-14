@@ -95,7 +95,6 @@ pub fn sign_transaction_hash(
     transaction_xdr_base64: &str,
 ) -> AppResult<String> {
     use sha2::{Sha256, Digest};
-    use next_xdr::{Transaction, WriteXdr, Limits};
     use ed25519_dalek::SigningKey;
 
     // 1. Prepare Network ID

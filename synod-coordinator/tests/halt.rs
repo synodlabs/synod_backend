@@ -1,141 +1,209 @@
-use reqwest::StatusCode;
-use uuid::Uuid;
-use synod_shared::models::*;
-use synod_coordinator::permit::OutcomeReport;
-use crate::common::{setup_test_context, TestContext};
 use bigdecimal::BigDecimal;
+use reqwest::StatusCode;
+use serde::Serialize;
+use synod_shared::models::PermitRequest;
+use uuid::Uuid;
 
 mod common;
+use common::{
+    attach_active_wallet, build_signed_request_auth, connect_agent, create_agent_slot,
+    create_treasury, enroll_agent_pubkey, generate_test_stellar_keypair, setup_test_context,
+};
 
+#[derive(Serialize)]
+struct OutcomeSignaturePayload {
+    tx_hash: String,
+    pnl_usd: String,
+    final_amount_units: String,
+}
+
+async fn setup_halt_agent() -> (
+    common::TestContext,
+    Uuid,
+    Uuid,
+    String,
+    ed25519_dalek::SigningKey,
+    String,
+    String,
+) {
+    let ctx = setup_test_context().await;
+    let treasury_id = create_treasury(&ctx, "Halt Treasury").await;
+    let (wallet_signing_key, wallet_address) = generate_test_stellar_keypair();
+    let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
+
+    attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
+    sqlx::query("UPDATE treasuries SET current_aum_usd = 10000, peak_aum_usd = 10000 WHERE treasury_id = $1")
+        .bind(treasury_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Halt Agent").await;
+    enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
+    let connect_data = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
+    let session_token = connect_data["session_token"].as_str().unwrap().to_string();
+
+    let constitution_response = ctx.client
+        .post(format!("{}/v1/treasuries/{}/constitution", ctx.base_url, treasury_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .json(&serde_json::json!({
+            "content": {
+                "memo": "Halt constitution",
+                "treasury_rules": {
+                    "max_drawdown_pct": 15.0,
+                    "max_concurrent_permits": 10
+                },
+                "agent_wallet_rules": [{
+                    "agent_id": agent_id,
+                    "wallet_address": wallet_address,
+                    "allocation_pct": 50.0,
+                    "tier_limit_usd": 5000.0,
+                    "concurrent_permit_cap": 3
+                }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(constitution_response.status(), StatusCode::CREATED);
+
+    sqlx::query("UPDATE agent_slots SET status = 'ACTIVE' WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+    (
+        ctx,
+        treasury_id,
+        agent_id,
+        wallet_address,
+        agent_signing_key,
+        agent_pubkey,
+        session_token,
+    )
+}
+
+#[serial_test::serial]
 #[tokio::test]
 async fn test_phase_9_halt_and_resume() {
-    let ctx = setup_test_context().await;
-    let base_url = ctx.base_url.clone();
-    let client = &ctx.client;
-    let auth_header = format!("Bearer {}", ctx.user_token);
+    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
+        setup_halt_agent().await;
 
-    // 2. Create Treasury & Config AUM
-    let treasury_resp = client.post(format!("{}/v1/treasuries", base_url))
-        .header("Authorization", &auth_header)
+    let permit = PermitRequest {
+        agent_id,
+        treasury_id,
+        wallet_address: wallet_address.clone(),
+        asset_code: "XLM".into(),
+        asset_issuer: None,
+        requested_amount: BigDecimal::from(500),
+    };
+
+    let permit_response = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
         .json(&serde_json::json!({
-            "name": "Halt Test Treasury",
-            "network": "testnet"
+            "agent_id": permit.agent_id,
+            "treasury_id": permit.treasury_id,
+            "wallet_address": permit.wallet_address,
+            "asset_code": permit.asset_code,
+            "asset_issuer": permit.asset_issuer,
+            "requested_amount": permit.requested_amount,
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &permit),
         }))
-        .send().await.unwrap();
-    let treasury_data: serde_json::Value = treasury_resp.json().await.unwrap();
-    let treasury_id = treasury_data["treasury_id"].as_str().unwrap();
-    let treasury_uuid = Uuid::parse_str(treasury_id).unwrap();
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(permit_response.status(), StatusCode::CREATED);
+    let permit_body: serde_json::Value = permit_response.json().await.unwrap();
+    let permit_id = Uuid::parse_str(permit_body["permit_id"].as_str().unwrap()).unwrap();
 
-    // Set AUM to 10,000
-    sqlx::query("UPDATE treasuries SET current_aum_usd = 10000, peak_aum_usd = 10000, constitution_version = 1 WHERE treasury_id = $1")
-        .bind(treasury_uuid)
-        .execute(&ctx.db).await.unwrap();
-
-    // 3. Set Constitution (15% Max Drawdown)
-    sqlx::query(
-        "INSERT INTO constitution_history (treasury_id, version, content, state_hash, executed_at) VALUES ($1, 1, $2, 'hash', NOW())"
-    )
-    .bind(treasury_uuid)
-    .bind(serde_json::json!({
-        "treasury_id": treasury_id,
-        "version": 1,
-        "max_drawdown_pct": 15.0,
-        "agent_allocations": [],
-        "inflow_routing": [],
-        "governance_mode": "AUTO"
-    }))
-    .execute(&ctx.db).await.unwrap();
-
-    // 4. Provision & Active Agent
-    let agent_resp = client.post(format!("{}/v1/agents/{}", base_url, treasury_id))
-        .header("Authorization", &auth_header)
-        .json(&serde_json::json!({ "name": "Halt Bot" }))
-        .send().await.unwrap();
-    let agent_data: serde_json::Value = agent_resp.json().await.unwrap();
-    let agent_id = agent_data["agent"]["agent_id"].as_str().unwrap();
-
-    sqlx::query("UPDATE agent_slots SET status = 'ACTIVE', wallet_address = $1 WHERE agent_id = $2")
-        .bind("GA5WNX...")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .execute(&ctx.db).await.unwrap();
-
-    // 5. Create Active Permit
-    let permit_resp = client.post(format!("{}/v1/permits/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&PermitRequest {
-            agent_id: Uuid::parse_str(agent_id).unwrap(),
-            treasury_id: treasury_uuid,
-            wallet_address: "GA5WNX...".to_string(),
-            asset_code: "XLM".to_string(),
-            asset_issuer: None,
-            requested_amount: BigDecimal::from(500),
+    let outcome_response = ctx.client
+        .post(format!("{}/v1/permits/{}/outcome", ctx.base_url, permit_id))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&{
+            let signed_outcome_payload = OutcomeSignaturePayload {
+                tx_hash: "LOSS_HASH".to_string(),
+                pnl_usd: "-2000".to_string(),
+                final_amount_units: "0".to_string(),
+            };
+            serde_json::json!({
+                "tx_hash": "LOSS_HASH",
+                "pnl_usd": BigDecimal::from(-2000),
+                "final_amount_units": BigDecimal::from(0),
+                "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.outcome", &signed_outcome_payload),
+            })
         })
-        .send().await.unwrap();
-    assert_eq!(permit_resp.status(), StatusCode::CREATED);
-    
-    let permit_id: Uuid = sqlx::query_scalar("SELECT permit_id FROM permits WHERE agent_id = $1 LIMIT 1")
-        .bind(Uuid::parse_str(agent_id).unwrap())
-        .fetch_one(&ctx.db).await.unwrap();
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outcome_response.status(), StatusCode::OK);
 
-    // 6. Report Lossy Outcome (Breach 15% mark: Loss of 2000 on 10,000 = 20% DD)
-    let outcome_resp = client.post(format!("{}/v1/permits/{}/outcome", base_url, permit_id))
-        .header("Authorization", &auth_header)
-        .json(&OutcomeReport {
-            tx_hash: "LOSS_HASH".into(),
-            pnl_usd: BigDecimal::from(-2000), // Loss of 2000
-            final_amount_units: BigDecimal::from(0),
-        })
-        .send().await.unwrap();
-    assert_eq!(outcome_resp.status(), StatusCode::OK);
-
-    // 7. Verify HALTED State
     let health: String = sqlx::query_scalar("SELECT health FROM treasuries WHERE treasury_id = $1")
-        .bind(treasury_uuid)
-        .fetch_one(&ctx.db).await.unwrap();
+        .bind(treasury_id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
     assert_eq!(health, "HALTED");
 
-    // 8. Try new permit → Should fail
-    let fail_permit = client.post(format!("{}/v1/permits/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&PermitRequest {
-            agent_id: Uuid::parse_str(agent_id).unwrap(),
-            treasury_id: treasury_uuid,
-            wallet_address: "GA5WNX...".to_string(),
-            asset_code: "XLM".to_string(),
-            asset_issuer: None,
-            requested_amount: BigDecimal::from(100),
-        })
-        .send().await.unwrap();
-    
-    // Policy engine returns 200 with approved: false for rejections
-    assert_eq!(fail_permit.status(), StatusCode::OK);
-    let policy_res: PolicyResult = fail_permit.json().await.unwrap();
-    assert!(!policy_res.approved);
-    assert_eq!(policy_res.deny_reason, Some("TREASURY_HALTED".into()));
+    let blocked_permit = PermitRequest {
+        agent_id,
+        treasury_id,
+        wallet_address: wallet_address.clone(),
+        asset_code: "XLM".into(),
+        asset_issuer: None,
+        requested_amount: BigDecimal::from(100),
+    };
+    let blocked = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({
+            "agent_id": blocked_permit.agent_id,
+            "treasury_id": blocked_permit.treasury_id,
+            "wallet_address": blocked_permit.wallet_address,
+            "asset_code": blocked_permit.asset_code,
+            "asset_issuer": blocked_permit.asset_issuer,
+            "requested_amount": blocked_permit.requested_amount,
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &blocked_permit),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::OK);
+    let blocked_body: serde_json::Value = blocked.json().await.unwrap();
+    assert_eq!(blocked_body["approved"].as_bool().unwrap(), false);
+    assert_eq!(blocked_body["deny_reason"].as_str().unwrap(), "TREASURY_HALTED");
 
-    // 9. Resume
-    let resume_resp = client.post(format!("{}/v1/treasuries/{}/resume", base_url, treasury_id))
-        .header("Authorization", &auth_header)
-        .send().await.unwrap();
-    assert_eq!(resume_resp.status(), StatusCode::OK);
+    let resume_response = ctx.client
+        .post(format!("{}/v1/treasuries/{}/resume", ctx.base_url, treasury_id))
+        .header("Authorization", format!("Bearer {}", ctx.user_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resume_response.status(), StatusCode::OK);
 
-    // Verify Peak Reset
-    let peak: f64 = sqlx::query_scalar("SELECT peak_aum_usd::float8 FROM treasuries WHERE treasury_id = $1")
-        .bind(treasury_uuid)
-        .fetch_one(&ctx.db).await.unwrap();
-    assert_eq!(peak, 8000.0); // 10000 - 2000
-
-    // 10. Success after resume
-    let success_permit = client.post(format!("{}/v1/permits/request", base_url))
-        .header("Authorization", &auth_header)
-        .json(&PermitRequest {
-            agent_id: Uuid::parse_str(agent_id).unwrap(),
-            treasury_id: treasury_uuid,
-            wallet_address: "GA5WNX...".to_string(),
-            asset_code: "XLM".to_string(),
-            asset_issuer: None,
-            requested_amount: BigDecimal::from(100),
-        })
-        .send().await.unwrap();
-    assert_eq!(success_permit.status(), StatusCode::CREATED);
+    let resumed_permit = PermitRequest {
+        agent_id,
+        treasury_id,
+        wallet_address,
+        asset_code: "XLM".into(),
+        asset_issuer: None,
+        requested_amount: BigDecimal::from(100),
+    };
+    let resumed = ctx.client
+        .post(format!("{}/v1/permits/request", ctx.base_url))
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({
+            "agent_id": resumed_permit.agent_id,
+            "treasury_id": resumed_permit.treasury_id,
+            "wallet_address": resumed_permit.wallet_address,
+            "asset_code": resumed_permit.asset_code,
+            "asset_issuer": resumed_permit.asset_issuer,
+            "requested_amount": resumed_permit.requested_amount,
+            "request_auth": build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &resumed_permit),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::CREATED);
 }

@@ -1,17 +1,10 @@
-use axum::{body::Body, extract::Request, http::{header, Method, StatusCode}};
-use reqwest;
+use axum::http::StatusCode;
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
-use std::net::SocketAddr;
-use synod_coordinator::{config::Settings, AppState};
-use std::time::Duration;
-use tokio::net::TcpListener;
-use axum_extra::headers::authorization::Bearer;
-use axum_extra::headers::Authorization;
 
 mod common;
 use common::spawn_test_server;
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_email_password_flow() {
     let base_url = spawn_test_server().await;
@@ -42,6 +35,7 @@ async fn test_email_password_flow() {
     assert!(login_body.get("token").is_some(), "Login should return a JWT");
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_rate_limiting_11th_attempt_fails() {
     let base_url = spawn_test_server().await;
@@ -64,6 +58,7 @@ async fn test_rate_limiting_11th_attempt_fails() {
     }
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn test_passkey_flow() {
     let base_url = spawn_test_server().await;

@@ -18,6 +18,15 @@ pub enum AppError {
     #[error("Challenge expired")]
     ChallengeExpired,
 
+    #[error("Invalid agent session")]
+    InvalidAgentSession,
+
+    #[error("Request signature invalid")]
+    RequestSignatureInvalid,
+
+    #[error("Request replay detected")]
+    RequestReplay,
+
     #[error("Rate limited")]
     RateLimited,
 
@@ -110,6 +119,9 @@ impl IntoResponse for AppError {
             AppError::TokenExpired => (StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED"),
             AppError::TokenInvalid => (StatusCode::UNAUTHORIZED, "TOKEN_INVALID"),
             AppError::ChallengeExpired => (StatusCode::UNAUTHORIZED, "CHALLENGE_EXPIRED"),
+            AppError::InvalidAgentSession => (StatusCode::UNAUTHORIZED, "INVALID_AGENT_SESSION"),
+            AppError::RequestSignatureInvalid => (StatusCode::UNAUTHORIZED, "REQUEST_SIGNATURE_INVALID"),
+            AppError::RequestReplay => (StatusCode::CONFLICT, "REQUEST_REPLAY"),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             AppError::TreasuryNotFound => (StatusCode::NOT_FOUND, "TREASURY_NOT_FOUND"),
             AppError::TreasuryHalted => (StatusCode::FORBIDDEN, "TREASURY_HALTED"),
