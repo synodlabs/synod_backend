@@ -188,11 +188,51 @@ fn create_jwt(user_id: Uuid, secret: &str, expiry_hours: u64) -> AppResult<Strin
         .map_err(|_| AppError::Internal(anyhow::anyhow!("JWT encoding failed")))
 }
 
-fn make_session_cookie(token: &str, max_age_hours: u64) -> String {
+fn should_use_secure_cookie(headers: &HeaderMap) -> bool {
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        return proto.eq_ignore_ascii_case("https");
+    }
+
+    if let Some(forwarded) = headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+    {
+        if forwarded
+            .split(';')
+            .map(str::trim)
+            .any(|part| part.eq_ignore_ascii_case("proto=https"))
+        {
+            return true;
+        }
+    }
+
+    headers
+        .get("origin")
+        .or_else(|| headers.get("referer"))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("https://"))
+        .unwrap_or(false)
+}
+
+fn make_session_cookie(token: &str, max_age_hours: u64, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
     format!(
-        "synod_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        "synod_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
         token,
-        max_age_hours * 3600
+        max_age_hours * 3600,
+        secure_attr
+    )
+}
+
+fn clear_session_cookie(secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!(
+        "synod_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        secure_attr
     )
 }
 
@@ -343,6 +383,7 @@ async fn record_failed_attempt(ip: &str, redis: &mut redis::aio::ConnectionManag
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<AuthRequest>,
 ) -> AppResult<impl IntoResponse> {
     let email = payload.email.to_lowercase();
@@ -371,7 +412,11 @@ pub async fn register(
                 &state.config.auth.jwt_secret,
                 state.config.auth.jwt_expiry_hours,
             )?;
-            let cookie = make_session_cookie(&token, state.config.auth.jwt_expiry_hours);
+            let cookie = make_session_cookie(
+                &token,
+                state.config.auth.jwt_expiry_hours,
+                should_use_secure_cookie(&headers),
+            );
             Ok((
                 [(axum::http::header::SET_COOKIE, cookie)],
                 Json(AuthResponse { token, user_id }),
@@ -428,7 +473,11 @@ pub async fn login(
                 .execute(&state.db)
                 .await;
 
-            let cookie = make_session_cookie(&token, state.config.auth.jwt_expiry_hours);
+            let cookie = make_session_cookie(
+                &token,
+                state.config.auth.jwt_expiry_hours,
+                should_use_secure_cookie(&headers),
+            );
             return Ok((
                 [(axum::http::header::SET_COOKIE, cookie)],
                 Json(AuthResponse { token, user_id }),
@@ -457,10 +506,10 @@ pub async fn me(
     }))
 }
 
-pub async fn logout() -> impl IntoResponse {
-    let cookie = "synod_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+pub async fn logout(headers: HeaderMap) -> impl IntoResponse {
+    let cookie = clear_session_cookie(should_use_secure_cookie(&headers));
     (
-        [(axum::http::header::SET_COOKIE, cookie.to_string())],
+        [(axum::http::header::SET_COOKIE, cookie)],
         Json(serde_json::json!({ "status": "logged_out" })),
     )
 }

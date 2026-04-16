@@ -5,12 +5,35 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use uuid::Uuid;
 use crate::error::{AppResult, AppError};
 use crate::AppState;
 use crate::auth::AuthUser;
 use crate::resync::WalletBalance;
 use sqlx::Row;
+
+async fn user_owns_treasury(state: &AppState, user_id: Uuid, treasury_id: Uuid) -> AppResult<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)"
+    )
+    .bind(treasury_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(Into::into)
+}
+
+async fn owned_treasury_ids(state: &AppState, user_id: Uuid) -> AppResult<HashSet<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT treasury_id FROM treasuries WHERE owner_user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(ids.into_iter().collect())
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TreasurySummary {
@@ -65,16 +88,17 @@ pub async fn list_treasuries(
 
 pub async fn get_treasury_state(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<DashboardTreasuryState>> {
     let row = sqlx::query(
         "SELECT t.treasury_id, t.name, t.network, t.health, t.current_aum_usd::float8, t.peak_aum_usd::float8, t.constitution_version, c.content
          FROM treasuries t
          LEFT JOIN constitution_history c ON c.treasury_id = t.treasury_id AND c.version = t.constitution_version
-         WHERE t.treasury_id = $1"
+         WHERE t.treasury_id = $1 AND t.owner_user_id = $2"
     )
     .bind(id)
+    .bind(auth.user_id)
     .fetch_optional(&state.db)
     .await?
     .ok_or(AppError::TreasuryNotFound)?;
@@ -135,10 +159,15 @@ pub async fn get_treasury_state(
 /// Return cached balance snapshot for a treasury's wallets
 pub async fn get_treasury_balances(
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<DashboardBalances>> {
     use redis::AsyncCommands;
+
+    if !user_owns_treasury(&state, auth.user_id, id).await? {
+        return Err(AppError::TreasuryNotFound);
+    }
+
     let mut redis = state.redis.clone();
 
     let snapshot_key = format!("treasury:snapshot:{}", id);
@@ -164,16 +193,30 @@ pub async fn get_treasury_balances(
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, _auth))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, auth))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState, _auth: AuthUser) {
+async fn handle_socket(mut socket: WebSocket, state: AppState, auth: AuthUser) {
     let mut rx = state.tx_events.subscribe();
+    let mut allowed_treasuries = owned_treasury_ids(&state, auth.user_id)
+        .await
+        .unwrap_or_default();
     
     while let Ok(event) = rx.recv().await {
-        // Send unified EventEnvelope format
+        let treasury_id = event.treasury_id();
+
+        if !allowed_treasuries.contains(&treasury_id) {
+            match user_owns_treasury(&state, auth.user_id, treasury_id).await {
+                Ok(true) => {
+                    allowed_treasuries.insert(treasury_id);
+                }
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+
         let envelope = event.to_envelope();
         let msg = serde_json::to_string(&envelope).unwrap();
         if socket.send(Message::Text(msg)).await.is_err() {

@@ -92,6 +92,23 @@ pub enum TreasuryEvent {
 }
 
 impl TreasuryEvent {
+    pub fn treasury_id(&self) -> Uuid {
+        match self {
+            TreasuryEvent::WalletBalanceUpdate { treasury_id, .. }
+            | TreasuryEvent::ConstitutionUpdate { treasury_id, .. }
+            | TreasuryEvent::PermitIssued { treasury_id, .. }
+            | TreasuryEvent::PermitConsumed { treasury_id, .. }
+            | TreasuryEvent::PermitExpired { treasury_id, .. }
+            | TreasuryEvent::TreasuryHalted { treasury_id }
+            | TreasuryEvent::TreasuryResumed { treasury_id }
+            | TreasuryEvent::AgentSuspended { treasury_id, .. }
+            | TreasuryEvent::AgentStatusChanged { treasury_id, .. }
+            | TreasuryEvent::AgentConnected { treasury_id, .. }
+            | TreasuryEvent::AgentSignerAdded { treasury_id, .. }
+            | TreasuryEvent::AgentActivated { treasury_id, .. } => *treasury_id,
+        }
+    }
+
     /// Convert to a unified EventEnvelope with SCREAMING_SNAKE event_type.
     pub fn to_envelope(&self) -> EventEnvelope {
         let (event_type, payload) = match self {
