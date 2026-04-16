@@ -5,8 +5,8 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 mod common;
 use common::{
-    attach_active_wallet, connect_agent, create_agent_slot, create_treasury, enroll_agent_pubkey,
-    generate_test_stellar_keypair, setup_test_context,
+    attach_active_wallet, connect_agent, connect_agent_mcp, create_agent_slot, create_treasury,
+    enroll_agent_pubkey, generate_test_stellar_keypair, setup_test_context,
 };
 
 #[serial_test::serial]
@@ -169,4 +169,55 @@ async fn test_suspended_agent_cannot_start_connect_challenge() {
         .await
         .unwrap();
     assert_eq!(challenge_response.status(), StatusCode::FORBIDDEN);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn test_mcp_ready_flips_immediately_after_slot_creation() {
+    let ctx = setup_test_context().await;
+    let treasury_id = create_treasury(&ctx, "MCP Ready Treasury").await;
+    let (_agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
+
+    create_agent_slot(&ctx, treasury_id, "MCP Ready Agent", &agent_pubkey).await;
+
+    let response = ctx.client
+        .get(format!("{}/connect/status", ctx.base_url))
+        .query(&[("public_key", agent_pubkey.as_str())])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"].as_str().unwrap(), "ready");
+    assert_eq!(body["connect_allowed"].as_bool().unwrap(), true);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn test_mcp_connect_handshake_and_ws_work_with_slot_only() {
+    let ctx = setup_test_context().await;
+    let treasury_id = create_treasury(&ctx, "MCP Connect Treasury").await;
+    let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
+    let agent_id = create_agent_slot(&ctx, treasury_id, "MCP Connect Agent", &agent_pubkey).await;
+
+    let connected = connect_agent_mcp(&ctx, &agent_pubkey, &agent_signing_key).await;
+    assert_eq!(connected["agent_id"].as_str().unwrap(), agent_id.to_string());
+    assert!(connected["ws_ticket"].as_str().is_some());
+
+    let ws_ticket = connected["ws_ticket"].as_str().unwrap();
+    let ws_url = ctx.base_url.replace("http://", "ws://") + &format!("/agent/ws?ticket={}", ws_ticket);
+    let (mut ws_stream, _) = connect_async(ws_url).await.expect("mcp ws should connect");
+
+    ws_stream.send(Message::Text("ping".into())).await.unwrap();
+    let message = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    match message {
+        Message::Text(text) => assert_eq!(text, "pong"),
+        other => panic!("expected pong, got {:?}", other),
+    }
 }

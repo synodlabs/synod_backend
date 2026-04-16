@@ -410,7 +410,7 @@ fn build_shared_constitution(
     }
 }
 
-async fn process_single_permit(
+pub(crate) async fn process_single_permit(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     _state: &AppState,
     payload: &PermitRequest,

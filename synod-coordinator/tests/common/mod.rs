@@ -116,6 +116,14 @@ pub fn sign_with_key(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) ->
     let signature = signing_key.sign(&hashed);
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes())
 }
+
+#[allow(dead_code)]
+pub fn sign_raw_bytes(signing_key: &ed25519_dalek::SigningKey, message: &[u8]) -> String {
+    use ed25519_dalek::Signer;
+
+    let signature = signing_key.sign(message);
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes())
+}
 #[allow(dead_code)]
 pub struct TestContext {
     pub base_url: String,
@@ -296,6 +304,39 @@ pub async fn connect_agent(
         .unwrap();
 
     connect_response.json().await.unwrap()
+}
+
+#[allow(dead_code)]
+pub async fn connect_agent_mcp(
+    ctx: &TestContext,
+    agent_pubkey: &str,
+    agent_signing_key: &ed25519_dalek::SigningKey,
+) -> serde_json::Value {
+    let init_response = ctx.client
+        .post(format!("{}/connect/init", ctx.base_url))
+        .json(&serde_json::json!({ "public_key": agent_pubkey }))
+        .send()
+        .await
+        .unwrap();
+
+    let init_body: serde_json::Value = init_response.json().await.unwrap();
+    let nonce = init_body["nonce"].as_str().unwrap();
+    let payload = format!(r#"{{"action":"connect","domain":"synod","nonce":"{}"}}"#, nonce);
+    let hash = synod_coordinator::stellar::sha256_bytes(payload.as_bytes());
+    let signature = sign_raw_bytes(agent_signing_key, &hash);
+
+    let complete_response = ctx.client
+        .post(format!("{}/connect/complete", ctx.base_url))
+        .json(&serde_json::json!({
+            "public_key": agent_pubkey,
+            "signature": signature,
+            "nonce": nonce,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    complete_response.json().await.unwrap()
 }
 
 #[allow(dead_code)]

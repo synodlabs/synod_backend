@@ -413,7 +413,7 @@ async fn create_agent_slot(
             created_at,
             fast_token_hash,
             status
-        ) VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, 'PENDING_SIGNER')"#,
+        ) VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, 'PENDING_CONFIGURATION')"#,
     )
     .bind(agent_id)
     .bind(treasury_id)
@@ -431,7 +431,7 @@ async fn create_agent_slot(
         description: payload.description,
         wallet_address: None,
         agent_pubkey: Some(pubkey.to_string()),
-        status: "PENDING_SIGNER".to_string(),
+        status: "PENDING_CONFIGURATION".to_string(),
         allocation_pct: 0.0,
         tier_limit_usd: 0.0,
         concurrent_permit_cap: 0,
@@ -442,7 +442,7 @@ async fn create_agent_slot(
     let _ = state.tx_events.send(crate::TreasuryEvent::AgentStatusChanged {
         treasury_id,
         agent_id,
-        new_status: "PENDING_SIGNER".to_string(),
+        new_status: "PENDING_CONFIGURATION".to_string(),
     });
 
     Ok((axum::http::StatusCode::CREATED, Json(CreateAgentResponse { agent })))

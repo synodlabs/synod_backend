@@ -1,6 +1,7 @@
 pub use stellar_xdr::curr as next_xdr;
 use crate::error::{AppError, AppResult};
 use ed25519_dalek::{Signer, Signature, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
 use std::convert::TryInto;
 
 pub fn verify_stellar_signature(
@@ -21,8 +22,6 @@ pub fn verify_stellar_signature(
 
     // Freighter (and the Stellar ecosystem standard) signs:
     // SHA256("Stellar Signed Message:\n" + message)
-    use sha2::{Sha256, Digest};
-
     let mut hasher = Sha256::new();
     hasher.update(b"Stellar Signed Message:\n");
     hasher.update(message);
@@ -30,6 +29,36 @@ pub fn verify_stellar_signature(
 
     verifying_key.verify(&hashed_payload, &signature)
         .map_err(|_| AppError::OwnershipVerificationFailed)
+}
+
+pub fn sha256_bytes(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+pub fn verify_raw_ed25519_signature(
+    public_key_str: &str,
+    message: &[u8],
+    signature_base64: &str,
+) -> AppResult<()> {
+    let public_key_bytes = decode_stellar_address(public_key_str)?;
+    let signature_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
+        .map_err(|_| AppError::RequestSignatureInvalid)?;
+
+    let verifying_key = VerifyingKey::from_bytes(
+        &public_key_bytes
+            .try_into()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid public key length")))?,
+    )
+    .map_err(|_| AppError::RequestSignatureInvalid)?;
+
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|_| AppError::RequestSignatureInvalid)?;
+
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| AppError::RequestSignatureInvalid)
 }
 
 pub fn decode_stellar_address(address: &str) -> AppResult<[u8; 32]> {
@@ -94,7 +123,6 @@ pub fn sign_transaction_hash(
     network_passphrase: &str,
     transaction_xdr_base64: &str,
 ) -> AppResult<String> {
-    use sha2::{Sha256, Digest};
     use ed25519_dalek::SigningKey;
 
     // 1. Prepare Network ID

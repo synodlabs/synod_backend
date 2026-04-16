@@ -13,6 +13,7 @@ pub mod policy;
 pub mod permit;
 pub mod dashboard;
 pub mod multisig;
+pub mod mcp;
 
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -89,6 +90,24 @@ pub enum TreasuryEvent {
         treasury_id: Uuid,
         agent_id: Uuid,
     },
+    IntentConfirmed {
+        treasury_id: Uuid,
+        agent_id: Uuid,
+        intent_id: Uuid,
+        tx_hash: Option<String>,
+    },
+    IntentRejected {
+        treasury_id: Uuid,
+        agent_id: Uuid,
+        intent_id: Uuid,
+        reason: String,
+    },
+    IntentFailed {
+        treasury_id: Uuid,
+        agent_id: Uuid,
+        intent_id: Uuid,
+        reason: String,
+    },
 }
 
 impl TreasuryEvent {
@@ -105,7 +124,10 @@ impl TreasuryEvent {
             | TreasuryEvent::AgentStatusChanged { treasury_id, .. }
             | TreasuryEvent::AgentConnected { treasury_id, .. }
             | TreasuryEvent::AgentSignerAdded { treasury_id, .. }
-            | TreasuryEvent::AgentActivated { treasury_id, .. } => *treasury_id,
+            | TreasuryEvent::AgentActivated { treasury_id, .. }
+            | TreasuryEvent::IntentConfirmed { treasury_id, .. }
+            | TreasuryEvent::IntentRejected { treasury_id, .. }
+            | TreasuryEvent::IntentFailed { treasury_id, .. } => *treasury_id,
         }
     }
 
@@ -160,6 +182,18 @@ impl TreasuryEvent {
                 "AGENT_ACTIVATED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id }),
             ),
+            TreasuryEvent::IntentConfirmed { treasury_id, agent_id, intent_id, tx_hash } => (
+                "INTENT_CONFIRMED",
+                serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "tx_hash": tx_hash }),
+            ),
+            TreasuryEvent::IntentRejected { treasury_id, agent_id, intent_id, reason } => (
+                "INTENT_REJECTED",
+                serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "reason": reason }),
+            ),
+            TreasuryEvent::IntentFailed { treasury_id, agent_id, intent_id, reason } => (
+                "INTENT_FAILED",
+                serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "reason": reason }),
+            ),
         };
 
         EventEnvelope {
@@ -192,6 +226,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(root))
+        .merge(mcp::router())
         .nest("/v1/auth", auth::router())
         .nest("/v1/treasuries", treasury_v1)
         .nest("/v1/wallets", wallet::router())
