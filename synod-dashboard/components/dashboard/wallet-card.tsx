@@ -82,7 +82,6 @@ export function WalletCard({ treasuryId, token, wallet, onDisconnect, onBalanceU
       setRevokeStep('preparing')
       setRevokeStatus("Fetching security context...")
       const setupRes = await fetch(`/v1/multisig/${treasuryId}/setup`, {
-        headers: { "Authorization": `Bearer ${token}` }
       })
       if (!setupRes.ok) throw new Error("Could not fetch co-signer info")
       const { coordinator_pubkey } = await setupRes.json()
@@ -147,7 +146,6 @@ export function WalletCard({ treasuryId, token, wallet, onDisconnect, onBalanceU
         await fetch(`/v1/multisig/${treasuryId}/revoke`, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${token}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
@@ -166,7 +164,6 @@ export function WalletCard({ treasuryId, token, wallet, onDisconnect, onBalanceU
         const res = await fetch(`/v1/multisig/${treasuryId}/revoke`, {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${token}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({

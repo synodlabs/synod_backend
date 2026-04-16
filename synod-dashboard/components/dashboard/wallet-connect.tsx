@@ -83,7 +83,7 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
       setStatusText("Analyzing authentication state...")
       const checkRes = await fetch("/v1/wallets/check-verified", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ wallet_address: addr }),
       })
 
@@ -98,7 +98,7 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
         setStatusText("Requesting challenge nonce...")
         const nRes = await fetch("/v1/wallets/nonce", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ wallet_address: addr }),
         })
         const nData = await nRes.json()
@@ -112,7 +112,7 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
         setStatusText("Verifying ownership with Synod...")
         const verifyRes = await fetch("/v1/wallets/verify-ownership", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ wallet_address: addr, signature, nonce: nData.nonce }),
         })
         if (!verifyRes.ok) throw new Error("Ownership verification failed")
@@ -121,7 +121,7 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
       // Always ensure linked to this treasury (idempotent on backend)
       await fetch(`/v1/treasuries/${treasuryId}/wallets`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ wallet_address: addr, label: "Managed Wallet" }),
       })
 
@@ -130,7 +130,7 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
 
       console.log("Fetching multisig setup for treasury", treasuryId);
       const setupRes = await fetch(`/v1/multisig/${treasuryId}/setup`, {
-        headers: { "Authorization": `Bearer ${token}` }
+        headers: {  }
       })
       if (!setupRes.ok) throw new Error("Failed to fetch multisig setup")
       const { coordinator_pubkey } = await setupRes.json()
@@ -182,7 +182,6 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
       setStatusText("Confirming with Synod...")
       const confirmRes = await fetch(`/v1/multisig/${treasuryId}/confirm`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
       })
       if (!confirmRes.ok) throw new Error("Confirmation failed")
 
@@ -318,3 +317,4 @@ export function WalletConnect({ treasuryId, token, activeWallets = [], onSuccess
     </>
   )
 }
+

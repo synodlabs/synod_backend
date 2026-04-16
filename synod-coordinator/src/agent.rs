@@ -47,6 +47,7 @@ pub struct AgentSlot {
 pub struct CreateAgentRequest {
     pub name: String,
     pub description: Option<String>,
+    pub agent_pubkey: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +55,7 @@ pub struct CreateAgentBodyRequest {
     pub treasury_id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    pub agent_pubkey: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +381,24 @@ async fn create_agent_slot(
         ));
     }
 
+    let pubkey = payload.agent_pubkey.trim();
+    if pubkey.len() != 56 || !pubkey.starts_with('G') {
+        return Err(AppError::InvalidInput(
+            "Invalid Stellar public key format".into(),
+        ));
+    }
+
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT agent_id FROM agent_slots WHERE agent_pubkey = $1"
+    )
+    .bind(pubkey)
+    .fetch_optional(&state.db)
+    .await?;
+
+    if existing.is_some() {
+        return Err(AppError::PubkeyConflict);
+    }
+
     let agent_id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -388,16 +408,18 @@ async fn create_agent_slot(
             treasury_id,
             name,
             description,
+            agent_pubkey,
             api_key_hash,
             created_at,
             fast_token_hash,
             status
-        ) VALUES ($1, $2, $3, $4, NULL, $5, NULL, 'PENDING_PUBKEY')"#,
+        ) VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, 'PENDING_SIGNER')"#,
     )
     .bind(agent_id)
     .bind(treasury_id)
     .bind(trimmed_name)
     .bind(&payload.description)
+    .bind(pubkey)
     .bind(now)
     .execute(&state.db)
     .await?;
@@ -408,8 +430,8 @@ async fn create_agent_slot(
         name: trimmed_name.to_string(),
         description: payload.description,
         wallet_address: None,
-        agent_pubkey: None,
-        status: "PENDING_PUBKEY".to_string(),
+        agent_pubkey: Some(pubkey.to_string()),
+        status: "PENDING_SIGNER".to_string(),
         allocation_pct: 0.0,
         tier_limit_usd: 0.0,
         concurrent_permit_cap: 0,
@@ -420,7 +442,7 @@ async fn create_agent_slot(
     let _ = state.tx_events.send(crate::TreasuryEvent::AgentStatusChanged {
         treasury_id,
         agent_id,
-        new_status: "PENDING_PUBKEY".to_string(),
+        new_status: "PENDING_SIGNER".to_string(),
     });
 
     Ok((axum::http::StatusCode::CREATED, Json(CreateAgentResponse { agent })))
@@ -500,6 +522,7 @@ pub async fn create_agent_from_body(
         CreateAgentRequest {
             name: payload.name,
             description: payload.description,
+            agent_pubkey: payload.agent_pubkey,
         },
     )
     .await

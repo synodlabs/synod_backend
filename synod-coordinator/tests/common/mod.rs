@@ -1,10 +1,12 @@
 use synod_coordinator::config::Settings;
 use sqlx::postgres::PgPoolOptions;
-use synod_coordinator::AppState;
+use synod_coordinator::{AppState, WatcherHandles};
 use redis::aio::ConnectionManager;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use uuid::Uuid;
+use std::{collections::HashMap, sync::Arc};
+use tokio::{sync::Mutex, task::JoinHandle};
 
 pub async fn spawn_test_server() -> String {
     let _ = tracing_subscriber::fmt()
@@ -70,6 +72,7 @@ pub async fn spawn_test_server() -> String {
         redis: redis_manager,
         config: settings,
         tx_events,
+        watcher_handles: Arc::new(Mutex::new(HashMap::<String, JoinHandle<()>>::new())) as WatcherHandles,
     };
 
     let app = synod_coordinator::router(state);
@@ -187,11 +190,20 @@ pub async fn attach_active_wallet(ctx: &TestContext, treasury_id: Uuid, wallet_a
 }
 
 #[allow(dead_code)]
-pub async fn create_agent_slot(ctx: &TestContext, treasury_id: Uuid, name: &str) -> Uuid {
+pub async fn create_agent_slot(
+    ctx: &TestContext,
+    treasury_id: Uuid,
+    name: &str,
+    agent_pubkey: &str,
+) -> Uuid {
     let response = ctx.client
         .post(format!("{}/v1/agents/{}", ctx.base_url, treasury_id))
         .header("Authorization", format!("Bearer {}", ctx.user_token))
-        .json(&serde_json::json!({ "name": name, "description": "Integration test agent" }))
+        .json(&serde_json::json!({
+            "name": name,
+            "description": "Integration test agent",
+            "agent_pubkey": agent_pubkey,
+        }))
         .send()
         .await
         .unwrap();

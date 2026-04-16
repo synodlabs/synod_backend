@@ -26,7 +26,6 @@ export function MultisigSetup({ treasuryId, onStatusChange }: MultisigSetupProps
         try {
             const token = localStorage.getItem('synod_token');
             const res = await fetch(`/v1/dashboard/${treasuryId}`, {
-                headers: { 'Authorization': `Bearer ${token}` }
             });
             if (res.ok) {
                 const data = await res.json();
@@ -50,7 +49,6 @@ export function MultisigSetup({ treasuryId, onStatusChange }: MultisigSetupProps
       
       // 1. Get Setup XDR
       const setupRes = await fetch(`/v1/multisig/${treasuryId}/setup`, {
-         headers: { 'Authorization': `Bearer ${token}` }
       });
       
       if (!setupRes.ok) throw new Error("Failed to generate multisig setup");
@@ -75,7 +73,6 @@ export function MultisigSetup({ treasuryId, onStatusChange }: MultisigSetupProps
           const confirmRes = await fetch(`/v1/multisig/${treasuryId}/confirm`, {
               method: 'POST',
               headers: { 
-                  'Authorization': `Bearer ${token}`,
                   'Content-Type': 'application/json'
               }
           });

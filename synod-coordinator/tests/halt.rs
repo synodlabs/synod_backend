@@ -38,7 +38,7 @@ async fn setup_halt_agent() -> (
         .await
         .unwrap();
 
-    let agent_id = create_agent_slot(&ctx, treasury_id, "Halt Agent").await;
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Halt Agent", &agent_pubkey).await;
     enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
     let connect_data = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
     let session_token = connect_data["session_token"].as_str().unwrap().to_string();

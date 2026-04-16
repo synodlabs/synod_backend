@@ -17,7 +17,7 @@ export function useSocket(token: string | null) {
 
     // Connect directly to the backend port (8080) for local development
     // since Next.js rewrites don't support WebSocket proxying out of the box.
-    const wsUrl = `ws://localhost:8080/v1/dashboard/ws?auth=${token}`
+    const wsUrl = `ws://localhost:8080/v1/dashboard/ws`
     
     ws.current = new WebSocket(wsUrl)
 

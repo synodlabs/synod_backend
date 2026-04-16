@@ -4,6 +4,8 @@ import { useEffect, useState } from "react"
 import { AlertTriangle } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import type { AgentSlot } from "@/components/dashboard/agent-manager"
+import { Horizon, Networks, Operation, TransactionBuilder } from "@stellar/stellar-sdk"
+import { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit"
 
 interface WalletSummary {
   wallet_address: string
@@ -53,7 +55,6 @@ interface PolicyManagerProps {
 interface RuleDraft {
   allocation_pct: string
   tier_limit_usd: string
-  concurrent_permit_cap: string
 }
 
 interface RevokeTarget {
@@ -61,6 +62,19 @@ interface RevokeTarget {
   walletAddress: string
   agentName: string
   walletLabel: string
+}
+
+interface CosignerPromptTarget {
+  agentId: string
+  walletAddress: string
+  agentName: string
+  walletLabel: string
+  agentPubkey: string
+}
+
+interface InteractionToast {
+  type: "error" | "success"
+  message: string
 }
 
 function truncateMiddle(value: string, left = 6, right = 4) {
@@ -98,6 +112,8 @@ export function PolicyManager({
   onTreasuryRefresh,
   onOpenAgent,
 }: PolicyManagerProps) {
+  const horizon = new Horizon.Server("https://horizon-testnet.stellar.org")
+  const [agentRows, setAgentRows] = useState<AgentSlot[]>(agents)
   const [constitution, setConstitution] = useState<ConstitutionResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -106,9 +122,33 @@ export function PolicyManager({
   const [maxDrawdown, setMaxDrawdown] = useState("")
   const [maxConcurrentPermits, setMaxConcurrentPermits] = useState("")
   const [editingCell, setEditingCell] = useState<string | null>(null)
-  const [draft, setDraft] = useState<RuleDraft>({ allocation_pct: "", tier_limit_usd: "", concurrent_permit_cap: "" })
+  const [draft, setDraft] = useState<RuleDraft>({ allocation_pct: "", tier_limit_usd: "" })
   const [revokeTarget, setRevokeTarget] = useState<RevokeTarget | null>(null)
   const [showResumeConfirm, setShowResumeConfirm] = useState(false)
+  const [cosignerPrompt, setCosignerPrompt] = useState<CosignerPromptTarget | null>(null)
+  const [isAddingCosigner, setIsAddingCosigner] = useState(false)
+  const [cosignerStatus, setCosignerStatus] = useState("")
+  const [interactionToast, setInteractionToast] = useState<InteractionToast | null>(null)
+  const [toastVisible, setToastVisible] = useState(false)
+
+  useEffect(() => {
+    setAgentRows(agents)
+  }, [agents])
+
+  useEffect(() => {
+    if (!interactionToast) return
+    setToastVisible(false)
+
+    const showTimer = window.setTimeout(() => setToastVisible(true), 10)
+    const hideTimer = window.setTimeout(() => setToastVisible(false), 3400)
+    const clearTimer = window.setTimeout(() => setInteractionToast(null), 3700)
+
+    return () => {
+      window.clearTimeout(showTimer)
+      window.clearTimeout(hideTimer)
+      window.clearTimeout(clearTimer)
+    }
+  }, [interactionToast])
 
   useEffect(() => {
     const loadConstitution = async () => {
@@ -119,7 +159,7 @@ export function PolicyManager({
 
       try {
         const res = await fetch(`/v1/treasuries/${treasuryId}/constitution`, {
-          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
         })
 
         if (!res.ok) {
@@ -162,7 +202,6 @@ export function PolicyManager({
       const res = await fetch(`/v1/treasuries/${treasuryId}/constitution`, {
         method: "PUT",
         headers: {
-          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ content }),
@@ -194,16 +233,143 @@ export function PolicyManager({
     )
   }
 
-  const startEditing = (agentId: string, walletAddress: string) => {
+  const refreshAgents = async () => {
+    if (!token) return agentRows
+
+    try {
+      const res = await fetch(`/v1/agents/${treasuryId}`, {
+        cache: "no-store",
+      })
+      if (!res.ok) throw new Error("Failed to refresh agents")
+
+      const data: AgentSlot[] = await res.json()
+      setAgentRows(data)
+      return data
+    } catch (err) {
+      console.error(err)
+      return agentRows
+    }
+  }
+
+  const hasBoundPubkey = (agent: AgentSlot) => Boolean(agent.agent_pubkey?.trim())
+
+  const showInteractionToast = (type: InteractionToast["type"], message: string) => {
+    setInteractionToast({ type, message })
+  }
+
+  const isAgentCosignerOnWallet = async (walletAddress: string, agentPubkey: string) => {
+    const account = await horizon.loadAccount(walletAddress)
+    return account.signers.some(
+      (signer) => signer.key === agentPubkey && Number(signer.weight) > 0,
+    )
+  }
+
+  const startEditing = async (agent: AgentSlot, wallet: WalletSummary) => {
+    let latestAgent = agent
+
+    if (!latestAgent.agent_pubkey?.trim()) {
+      const refreshedAgents = await refreshAgents()
+      latestAgent = refreshedAgents.find((item) => item.agent_id === agent.agent_id) ?? agent
+    }
+
+    const agentPubkey = latestAgent.agent_pubkey?.trim()
+
+    if (!agentPubkey) {
+      showInteractionToast("error", "Bind this agent public key in the Agent Slot first.")
+      if (onOpenAgent) {
+        onOpenAgent(latestAgent.agent_id)
+      }
+      return
+    }
+
+    try {
+      const isCosigner = await isAgentCosignerOnWallet(wallet.wallet_address, agentPubkey)
+      if (!isCosigner) {
+        setCosignerPrompt({
+          agentId: latestAgent.agent_id,
+          walletAddress: wallet.wallet_address,
+          agentName: latestAgent.name,
+          walletLabel: wallet.label || truncateMiddle(wallet.wallet_address, 8, 4),
+          agentPubkey,
+        })
+        setCosignerStatus("")
+        setNotice("")
+        setError("")
+        return
+      }
+    } catch (err) {
+      console.error(err)
+      showInteractionToast("error", err instanceof Error ? err.message : "Something went wrong")
+      return
+    }
+
+    const agentId = latestAgent.agent_id
+    const walletAddress = wallet.wallet_address
     const existing = getRule(agentId, walletAddress)
     setEditingCell(buildCellKey(agentId, walletAddress))
     setDraft({
       allocation_pct: existing ? String(existing.allocation_pct) : "",
       tier_limit_usd: existing ? String(existing.tier_limit_usd) : "",
-      concurrent_permit_cap: existing ? String(existing.concurrent_permit_cap) : "1",
     })
     setError("")
     setNotice("")
+  }
+
+  const addAgentAsCosigner = async () => {
+    if (!cosignerPrompt) return
+
+    setIsAddingCosigner(true)
+    setError("")
+    setNotice("")
+    setCosignerStatus("Preparing signer transaction...")
+    try {
+      const source = await horizon.loadAccount(cosignerPrompt.walletAddress)
+      const tx = new TransactionBuilder(source, {
+        fee: "1000",
+        networkPassphrase: Networks.TESTNET,
+      })
+        .addOperation(
+          Operation.setOptions({
+            signer: {
+              ed25519PublicKey: cosignerPrompt.agentPubkey,
+              weight: 1,
+            },
+          }),
+        )
+        .setTimeout(30)
+        .build()
+
+      setCosignerStatus("Sign in wallet popup...")
+      const signed = await StellarWalletsKit.signTransaction(tx.toXDR(), {
+        networkPassphrase: Networks.TESTNET,
+        address: cosignerPrompt.walletAddress,
+      })
+      if (!signed) {
+        throw new Error("Wallet signing rejected")
+      }
+
+      setCosignerStatus("Submitting to Stellar...")
+      const signedTx = TransactionBuilder.fromXDR(signed.signedTxXdr, Networks.TESTNET)
+      await horizon.submitTransaction(signedTx)
+
+      const confirmed = await isAgentCosignerOnWallet(
+        cosignerPrompt.walletAddress,
+        cosignerPrompt.agentPubkey,
+      )
+      if (!confirmed) {
+        throw new Error("Signer update not confirmed yet. Please try again.")
+      }
+
+      showInteractionToast("success", "Agent signer approved on wallet. You can now grant access rules.")
+      setCosignerPrompt(null)
+      setCosignerStatus("")
+    } catch (err) {
+      console.error(err)
+      showInteractionToast("error", err instanceof Error ? err.message : "Something went wrong")
+      setCosignerStatus("")
+    } finally {
+      setIsAddingCosigner(false)
+    }
   }
 
   const walletAllocationSnapshot = (walletAddress: string, editingAgentId?: string) => {
@@ -255,7 +421,6 @@ export function PolicyManager({
 
     const allocation = Number.parseFloat(draft.allocation_pct)
     const tierLimit = Number.parseFloat(draft.tier_limit_usd)
-    const concurrentCap = Number.parseInt(draft.concurrent_permit_cap, 10)
 
     if (!Number.isFinite(allocation) || allocation < 1 || allocation > 100) {
       setError("Allocation % must be between 1 and 100.")
@@ -264,11 +429,6 @@ export function PolicyManager({
 
     if (!Number.isFinite(tierLimit) || tierLimit <= 0) {
       setError("Tier Limit USD must be greater than 0.")
-      return
-    }
-
-    if (!Number.isInteger(concurrentCap) || concurrentCap < 1) {
-      setError("Concurrent Permit Cap must be an integer greater than or equal to 1.")
       return
     }
 
@@ -287,7 +447,9 @@ export function PolicyManager({
       wallet_address: walletAddress,
       allocation_pct: allocation,
       tier_limit_usd: tierLimit,
-      concurrent_permit_cap: concurrentCap,
+      concurrent_permit_cap:
+        getRule(agentId, walletAddress)?.concurrent_permit_cap ??
+        constitution.content.treasury_rules.max_concurrent_permits,
     })
 
     await saveConstitution(
@@ -324,7 +486,6 @@ export function PolicyManager({
     try {
       const res = await fetch(`/v1/treasuries/${treasuryId}/resume`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
       })
 
       if (!res.ok) {
@@ -366,11 +527,23 @@ export function PolicyManager({
   }
 
   const noWallets = wallets.length === 0
-  const noAgents = agents.length === 0
+  const noAgents = agentRows.length === 0
   const noRulesConfigured = constitution.content.agent_wallet_rules.length === 0
 
   return (
     <div className="space-y-6">
+      {interactionToast && (
+        <div
+          className={`fixed bottom-6 right-6 z-[70] max-w-sm rounded-xl border border-synod-border bg-[#07070b]/95 px-4 py-3 shadow-2xl transition-all duration-300 ease-out ${
+            toastVisible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+          }`}
+        >
+          <div className={`text-xs ${interactionToast.type === "error" ? "text-red-200" : "text-emerald-200"}`}>
+            {interactionToast.message}
+          </div>
+        </div>
+      )}
+
       <section className="rounded-md border border-synod-border bg-synod-card">
         <div className="flex flex-col gap-4 border-b border-synod-border px-5 py-4 lg:flex-row lg:items-end lg:justify-between">
           <div>
@@ -476,7 +649,7 @@ export function PolicyManager({
                   </thead>
 
                   <tbody>
-                    {agents.map((agent) => (
+                    {agentRows.map((agent) => (
                       <tr
                         key={agent.agent_id}
                         data-agent-row={agent.agent_id}
@@ -523,18 +696,6 @@ export function PolicyManager({
                                       className="h-10 w-full rounded-md border border-synod-border bg-zinc-950 px-3 text-sm text-white outline-none focus:border-white"
                                     />
                                   </div>
-                                  <div className="space-y-2">
-                                    <label className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Concurrent Permit Cap</label>
-                                    <input
-                                      type="number"
-                                      min="1"
-                                      step="1"
-                                      value={draft.concurrent_permit_cap}
-                                      onChange={(event) => setDraft((current) => ({ ...current, concurrent_permit_cap: event.target.value }))}
-                                      className="h-10 w-full rounded-md border border-synod-border bg-zinc-950 px-3 text-sm text-white outline-none focus:border-white"
-                                    />
-                                  </div>
-
                                   <div className={`rounded-md px-3 py-2 text-[10px] ${totals.exceeds ? "border border-red-500/25 bg-red-500/10 text-red-200" : totals.warning ? "border border-amber-500/20 bg-amber-500/10 text-amber-100" : "border border-synod-border bg-white/[0.02] text-synod-muted"}`}>
                                     {totals.allocated.toFixed(0)}% allocated across other agents. {Math.max(0, 100 - totals.total).toFixed(0)}% available.
                                   </div>
@@ -556,7 +717,7 @@ export function PolicyManager({
                                     <div>{existingRule.concurrent_permit_cap} concurrent</div>
                                   </div>
                                   <div className="flex gap-2">
-                                    <Button type="button" variant="ghost" size="sm" onClick={() => startEditing(agent.agent_id, wallet.wallet_address)} className="h-8 border border-synod-border px-3 text-[10px] font-bold uppercase tracking-[0.16em] text-white">
+                                    <Button type="button" variant="ghost" size="sm" onClick={() => void startEditing(agent, wallet)} className="h-8 border border-synod-border px-3 text-[10px] font-bold uppercase tracking-[0.16em] text-white">
                                       Edit
                                     </Button>
                                     <button
@@ -574,13 +735,26 @@ export function PolicyManager({
                                   </div>
                                 </div>
                               ) : (
-                                <button
-                                  type="button"
-                                  onClick={() => startEditing(agent.agent_id, wallet.wallet_address)}
-                                  className="inline-flex h-11 items-center justify-center rounded-md border border-dashed border-synod-border bg-black px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-synod-muted transition-colors hover:border-white hover:text-white"
-                                >
-                                  + Grant Access
-                                </button>
+                                hasBoundPubkey(agent) ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void startEditing(agent, wallet)}
+                                    className="inline-flex h-11 items-center justify-center rounded-md border border-dashed border-synod-border bg-black px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-synod-muted transition-colors hover:border-white hover:text-white"
+                                  >
+                                    + Grant Access
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      showInteractionToast("error", "This slot is still waiting for a public key binding.")
+                                      onOpenAgent?.(agent.agent_id)
+                                    }}
+                                    className="inline-flex h-11 items-center justify-center rounded-md border border-dashed border-amber-500/30 bg-amber-500/10 px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-amber-100 transition-colors hover:border-amber-300 hover:text-white"
+                                  >
+                                    Bind Key First
+                                  </button>
+                                )
                               )}
                             </td>
                           )
@@ -655,6 +829,55 @@ export function PolicyManager({
                 className="inline-flex h-10 items-center justify-center rounded-lg bg-red-600 px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:bg-red-500 disabled:opacity-60"
               >
                 {saving ? "Removing..." : "Confirm Revoke"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cosignerPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-2xl border border-synod-border bg-[#07070b] shadow-2xl">
+            <div className="border-b border-synod-border px-6 py-5 text-xl font-bold text-white">Approve Agent Co-Signer</div>
+            <div className="space-y-5 px-6 py-6">
+              <div className="flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-4">
+                <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-200" />
+                <p className="text-sm leading-6 text-synod-muted">
+                  {cosignerPrompt.agentName} must be an approved signer on {cosignerPrompt.walletLabel} before access rules can be set. Continue to sign the on-chain approval transaction in your wallet.
+                </p>
+              </div>
+
+              <div className="rounded-md border border-synod-border bg-black/60 px-4 py-3 text-[11px] font-mono text-synod-muted break-all">
+                {cosignerPrompt.agentPubkey}
+              </div>
+
+              {cosignerStatus && (
+                <div className="rounded-md border border-synod-border bg-white/[0.02] px-3 py-2 text-[10px] text-synod-muted">
+                  {cosignerStatus}
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end gap-3 px-6 pb-6">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  if (isAddingCosigner) return
+                  setCosignerPrompt(null)
+                  setCosignerStatus("")
+                }}
+                className="h-10 border border-synod-border px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-white"
+              >
+                Cancel
+              </Button>
+              <button
+                type="button"
+                onClick={addAgentAsCosigner}
+                disabled={isAddingCosigner}
+                className="inline-flex h-10 items-center justify-center rounded-lg bg-white px-4 text-[10px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200 disabled:opacity-60"
+              >
+                {isAddingCosigner ? "Processing..." : "Make Co-Signer"}
               </button>
             </div>
           </div>

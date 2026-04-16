@@ -26,7 +26,7 @@ interface AgentManagerProps {
 }
 
 type ProvisionResult = { agent: AgentSlot }
-type ProvisionStep = "form" | "success"
+type ProvisionStep = "name" | "connect"
 type SdkTab = "python" | "nodejs" | "rust"
 type CopyTarget = "agent_id" | "agent_pubkey" | null
 type SnippetTone = "comment" | "command" | "env" | "keyword" | "call" | "string" | "number" | "plain"
@@ -219,9 +219,8 @@ export function AgentManager({
   const [showRevokeModal, setShowRevokeModal] = useState(false)
   const [isProvisioning, setIsProvisioning] = useState(false)
   const [newAgentName, setNewAgentName] = useState("")
-  const [newAgentDescription, setNewAgentDescription] = useState("")
-  const [provisionResult, setProvisionResult] = useState<ProvisionResult | null>(null)
-  const [provisionStep, setProvisionStep] = useState<ProvisionStep>("form")
+  const [newAgentPubKey, setNewAgentPubKey] = useState("")
+  const [provisionStep, setProvisionStep] = useState<ProvisionStep>("name")
   const [copiedTarget, setCopiedTarget] = useState<CopyTarget>(null)
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
@@ -249,12 +248,8 @@ export function AgentManager({
     const found = agents.find((agent) => agent.agent_id === selectedAgentId)
     if (found) return found
 
-    if (provisionResult && provisionResult.agent.agent_id === selectedAgentId) {
-      return provisionResult.agent
-    }
-
     return agents[0] ?? null
-  }, [agents, provisionResult, selectedAgentId])
+  }, [agents, selectedAgentId])
 
   useEffect(() => {
     if (!selectedAgent) return
@@ -265,17 +260,27 @@ export function AgentManager({
 
   const resetProvisionModal = () => {
     setShowProvisionModal(false)
-    setProvisionResult(null)
-    setProvisionStep("form")
+    setProvisionStep("name")
     setNewAgentName("")
-    setNewAgentDescription("")
+    setNewAgentPubKey("")
     setModalError("")
     setCopiedTarget(null)
   }
 
-  const handleProvision = async (event: React.FormEvent<HTMLFormElement>) => {
+  const handleNextStep = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!token || !newAgentName.trim()) return
+    if (!newAgentName.trim()) return
+    setProvisionStep("connect")
+  }
+
+  const handleProvisionDone = async () => {
+    if (!token || !newAgentName.trim() || !newAgentPubKey.trim()) return
+
+    const pubkey = newAgentPubKey.trim()
+    if (pubkey.length !== 56 || !pubkey.startsWith('G')) {
+      setModalError("Invalid Stellar public key format.")
+      return
+    }
 
     setIsProvisioning(true)
     setModalError("")
@@ -284,12 +289,11 @@ export function AgentManager({
       const res = await fetch(`/v1/agents/${treasuryId}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
           name: newAgentName.trim(),
-          description: newAgentDescription.trim() || null,
+          agent_pubkey: pubkey,
         }),
       })
 
@@ -298,11 +302,15 @@ export function AgentManager({
         throw new Error(data?.message || "Failed to provision agent slot")
       }
 
-      const result: ProvisionResult = await res.json()
-      setProvisionResult(result)
-      setProvisionStep("success")
+      const result = await res.json()
+      const createdPubkey = result?.agent?.agent_pubkey?.trim?.() ?? ""
+      if (createdPubkey !== pubkey) {
+        throw new Error("The coordinator created this slot without the supplied public key. Restart the coordinator and try again.")
+      }
+
       setSelectedAgentId(result.agent.agent_id)
       await Promise.resolve(onAgentsChange())
+      resetProvisionModal()
     } catch (err) {
       console.error(err)
       setModalError(err instanceof Error ? err.message : "Provisioning failed. Please try again.")
@@ -320,7 +328,6 @@ export function AgentManager({
     try {
       const res = await fetch(`/v1/agents/${treasuryId}/${revokeTarget.agent_id}/revoke`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
       })
 
       if (!res.ok) {
@@ -357,7 +364,6 @@ export function AgentManager({
       const challengeRes = await fetch(`/v1/agents/${selectedAgent.agent_id}/enroll/challenge`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -384,7 +390,6 @@ export function AgentManager({
       const enrollRes = await fetch(`/v1/agents/${selectedAgent.agent_id}/enroll-pubkey`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
@@ -438,10 +443,9 @@ export function AgentManager({
               size="sm"
               onClick={() => {
                 setShowProvisionModal(true)
-                setProvisionResult(null)
-                setProvisionStep("form")
+                setProvisionStep("name")
                 setNewAgentName("")
-                setNewAgentDescription("")
+                setNewAgentPubKey("")
                 setModalError("")
                 setCopiedTarget(null)
               }}
@@ -492,20 +496,10 @@ export function AgentManager({
                             >
                               <td className="px-4 py-3 align-middle">
                                 <div className="truncate text-[11px] font-bold text-white">{agent.name}</div>
-                                <div className="mt-0.5 flex items-center gap-3 text-[9px] font-mono text-synod-muted-dark">
-                                  <span>{buildAgentToken(agent.agent_id)}</span>
-                                  {onManageRules && (
-                                    <button
-                                      type="button"
-                                      onClick={(event) => {
-                                        event.stopPropagation()
-                                        onManageRules(agent.agent_id)
-                                      }}
-                                      className="text-synod-warning transition-colors hover:text-white"
-                                    >
-                                      Manage Rules
-                                    </button>
-                                  )}
+                                <div className="mt-0.5 flex flex-wrap items-center gap-2">
+                                  <div className="font-mono text-[9px] text-synod-muted-dark">
+                                    {agent.agent_pubkey ? `${agent.agent_pubkey.slice(0, 8)}...` : "Pending..."}
+                                  </div>
                                 </div>
                               </td>
                               <td className="px-3 py-3 align-middle">
@@ -555,35 +549,14 @@ export function AgentManager({
               </div>
             </section>
 
-            <section className="rounded-md border border-synod-border bg-synod-card">
+            <section className="rounded-md border border-synod-border bg-synod-card min-h-[300px]">
               <div className="border-b border-synod-border px-5 py-4">
                 <div className="text-sm font-bold text-white">SDK Integration Guide</div>
-                <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">For agent developers</div>
+                <div className="mt-1 text-[10px] uppercase tracking-[0.18em] text-synod-muted">Coming soon</div>
               </div>
 
-              <div className="p-5">
-                <div className="mb-4 flex flex-wrap gap-2">
-                  {(["python", "nodejs", "rust"] as SdkTab[]).map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setSdkTab(tab)}
-                      className={`rounded-full border px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors ${sdkTab === tab ? "border-white bg-white text-black" : "border-synod-border bg-white/[0.02] text-synod-muted hover:text-white"}`}
-                    >
-                      {tab === "nodejs" ? "Node.js" : tab === "python" ? "Python" : "Rust"}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="rounded-md border border-synod-border bg-black px-4 py-4">
-                  <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.16em] text-synod-muted-dark">{SDK_SNIPPETS[sdkTab].language}</div>
-                  <pre className="custom-scrollbar overflow-x-auto font-mono text-[11px] leading-6">
-                    {SDK_SNIPPETS[sdkTab].lines.map((line, index) => (
-                      <div key={`${sdkTab}-${index}`} className={snippetToneClass(line.tone)}>
-                        {line.text || " "}
-                      </div>
-                    ))}
-                  </pre>
-                </div>
+              <div className="p-5 flex items-center justify-center h-full">
+                
               </div>
             </section>
           </div>
@@ -604,86 +577,23 @@ export function AgentManager({
                 <div className="space-y-6 p-5">
                   <section className="space-y-2">
                     <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Agent ID</div>
-                    <div className="rounded-md border border-synod-border bg-black px-4 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="font-mono text-[11px] text-white break-all">{selectedAgent.agent_id}</div>
-                        <button
-                          type="button"
-                          onClick={() => copyToClipboard(selectedAgent.agent_id, "agent_id")}
-                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
-                        >
-                          <Copy size={12} className="mr-1.5" />
-                          {copiedTarget === "agent_id" ? "Copied" : "Copy"}
-                        </button>
+                    <div className="flex items-center gap-2">
+                      <div className="font-mono text-[13px] text-white">
+                        {selectedAgent.agent_pubkey 
+                          ? `${selectedAgent.agent_pubkey.slice(0, 8)}...` 
+                          : "Pending..."}
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => copyToClipboard(selectedAgent.agent_pubkey || "", "agent_id")}
+                        className="text-synod-muted hover:text-white transition-colors p-1"
+                        title="Copy Agent ID"
+                      >
+                        <Copy size={12} />
+                      </button>
                     </div>
                   </section>
 
-                  <section className="space-y-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Description</div>
-                    <div className="rounded-md border border-synod-border bg-black px-4 py-3 text-sm text-white">
-                      {selectedAgent.description?.trim() || "No description provided for this slot."}
-                    </div>
-                  </section>
-
-                  <section className="space-y-3">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Bind Public Key</div>
-                    <div className="space-y-3 rounded-md border border-synod-border bg-black px-4 py-4">
-                      <p className="text-sm leading-6 text-synod-muted">
-                        Run your agent or `synod-mcp`, copy its public key, paste it here, then sign the binding with your treasury wallet.
-                      </p>
-
-                      <div className="space-y-2">
-                        <label className="text-[9px] uppercase tracking-[0.16em] text-synod-muted-dark">Agent Public Key</label>
-                        <textarea
-                          value={enrollmentPubkey}
-                          onChange={(event) => setEnrollmentPubkey(event.target.value.trim())}
-                          rows={3}
-                          placeholder="G..."
-                          className="w-full rounded-xl border border-synod-border bg-[#050508] px-4 py-3 font-mono text-[11px] text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
-                        />
-                      </div>
-
-                      {selectedAgent.agent_pubkey && (
-                        <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3">
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="text-[9px] uppercase tracking-[0.16em] text-emerald-200/80">Enrolled Key</div>
-                              <div className="mt-1 break-all font-mono text-[11px] text-white">{selectedAgent.agent_pubkey}</div>
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => copyToClipboard(selectedAgent.agent_pubkey!, "agent_pubkey")}
-                              className="inline-flex items-center rounded-md border border-emerald-400/20 bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-emerald-300/40"
-                            >
-                              <Copy size={12} className="mr-1.5" />
-                              {copiedTarget === "agent_pubkey" ? "Copied" : "Copy"}
-                            </button>
-                          </div>
-                        </div>
-                      )}
-
-                      {bindingError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{bindingError}</div>}
-                      {bindingStatus && !bindingError && (
-                        <div className="rounded-xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-xs text-sky-100">
-                          {bindingStatus}
-                        </div>
-                      )}
-
-                      <div className="flex justify-end">
-                        <Button
-                          type="button"
-                          variant="primary"
-                          size="sm"
-                          onClick={handleBindPublicKey}
-                          disabled={!enrollmentPubkey.trim() || bindingAgentId === selectedAgent.agent_id}
-                          className="h-10 px-4 text-[10px] font-bold uppercase tracking-[0.16em]"
-                        >
-                          {bindingAgentId === selectedAgent.agent_id ? "Binding..." : selectedAgent.agent_pubkey ? "Rebind Key" : "Bind Key"}
-                        </Button>
-                      </div>
-                    </div>
-                  </section>
 
                   <section className="space-y-3">
                     <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted">Capital Rules</div>
@@ -749,21 +659,17 @@ export function AgentManager({
 
       {showProvisionModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm">
-          <div className="w-full max-w-[560px] rounded-2xl border border-synod-border bg-[#07070b] shadow-2xl">
-            {provisionStep === "form" ? (
-              <form onSubmit={handleProvision}>
-                <div className="flex items-center justify-between border-b border-synod-border px-6 py-5">
-                  <div className="text-2xl font-bold text-white tracking-tight">Create Agent</div>
+          <div className="w-full max-w-md rounded-2xl border border-synod-border bg-[#07070b] shadow-2xl overflow-hidden">
+            {provisionStep === "name" ? (
+              <form onSubmit={handleNextStep}>
+                <div className="flex items-center justify-between border-b border-synod-border px-6 py-4 bg-white/[0.01]">
+                  <div className="text-lg font-bold text-white tracking-tight">Create Agent</div>
                   <button type="button" onClick={resetProvisionModal} className="text-synod-muted transition-colors hover:text-white">
-                    <X size={20} />
+                    <X size={18} />
                   </button>
                 </div>
 
-                <div className="space-y-6 px-6 py-6">
-                  <p className="max-w-xl text-sm leading-7 text-synod-muted">
-                    Agent slots create identity and credentials only. Capital rules are configured later in Policy.
-                  </p>
-
+                <div className="space-y-5 px-6 py-6">
                   <div className="space-y-2">
                     <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Agent Name</label>
                     <input
@@ -774,98 +680,89 @@ export function AgentManager({
                       value={newAgentName}
                       onChange={(event) => setNewAgentName(event.target.value)}
                       placeholder="e.g. Yield Optimizer Bot"
-                      className="h-14 w-full rounded-xl border border-synod-border bg-black px-4 font-mono text-sm text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
+                      className="h-12 w-full rounded-xl border border-synod-border bg-black px-4 font-mono text-sm text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
                     />
-                    <div className="text-[10px] text-synod-muted-dark">Required. Maximum 64 characters.</div>
                   </div>
-
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Description</label>
-                    <textarea
-                      maxLength={255}
-                      value={newAgentDescription}
-                      onChange={(event) => setNewAgentDescription(event.target.value)}
-                      placeholder="Optional context for operators and reviewers"
-                      className="min-h-[120px] w-full rounded-xl border border-synod-border bg-black px-4 py-4 text-sm text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
-                    />
-                    <div className="text-[10px] text-synod-muted-dark">Optional. Maximum 255 characters.</div>
-                  </div>
-
-                  {modalError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{modalError}</div>}
                 </div>
 
-                <div className="flex justify-end px-6 pb-6">
+                <div className="flex justify-end px-6 pb-6 mt-2">
                   <button
                     type="submit"
-                    disabled={isProvisioning}
-                    className="inline-flex h-12 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200 disabled:opacity-60"
+                    className="inline-flex h-10 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200"
                   >
-                    {isProvisioning ? "Creating..." : "Create"}
+                    Next
                   </button>
                 </div>
               </form>
-            ) : provisionResult ? (
+            ) : (
               <div>
-                <div className="flex items-center justify-between border-b border-synod-border px-6 py-5">
-                  <div className="text-2xl font-bold text-white tracking-tight">Agent Created</div>
+                <div className="flex items-center justify-between border-b border-synod-border px-6 py-4 bg-white/[0.01]">
+                  <div className="text-lg font-bold text-white tracking-tight">Connect Agent</div>
                   <button type="button" onClick={resetProvisionModal} className="text-synod-muted transition-colors hover:text-white">
-                    <X size={20} />
+                    <X size={18} />
                   </button>
                 </div>
 
                 <div className="space-y-6 px-6 py-6">
-                  <div className="flex items-start gap-3 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-4">
-                    <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-emerald-300" />
-                    <div>
-                      <div className="text-sm font-bold text-white">{provisionResult.agent.name}</div>
-                      <p className="mt-2 text-sm leading-6 text-synod-muted">
-                        The slot is ready. Next, run your agent, copy its generated public key, and bind it from this dashboard before the agent calls `connect()`.
-                      </p>
-                    </div>
-                  </div>
-
-                  <section className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Agent ID</label>
-                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="min-h-6 font-mono text-sm text-white break-all">{provisionResult.agent.agent_id}</div>
-                        <button
-                          type="button"
-                          onClick={() => copyToClipboard(provisionResult.agent.agent_id, "agent_id")}
-                          className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
-                        >
-                          <Copy size={12} className="mr-1.5" />
-                          {copiedTarget === "agent_id" ? "Copied" : "Copy"}
-                        </button>
+                  <section className="space-y-4">
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">What To Do Next</label>
+                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4 text-sm leading-relaxed text-synod-muted space-y-3">
+                      <div>
+                        <span className="font-bold text-white">1.</span> Copy skill and paste to agent.
+                        <div className="mt-2">
+                          <button
+                            type="button"
+                            onClick={() => copyToClipboard("https://synod.app/skills/core", "agent_id")}
+                            className="inline-flex items-center rounded-md border border-synod-border bg-white/[0.03] px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-white transition-colors hover:border-synod-border-strong"
+                          >
+                            <Copy size={12} className="mr-1.5" />
+                            {copiedTarget === "agent_id" ? "Copied" : "Copy Skill Link"}
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <span className="font-bold text-white">2.</span> The agent should return your public key. Copy the key and paste it here.
+                      </div>
+                      <div>
+                        <span className="font-bold text-white">3.</span> Click Done and go back, then prompt your agent to continue its connection.
                       </div>
                     </div>
                   </section>
 
                   <section className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">What To Do Next</label>
-                    <div className="rounded-xl border border-synod-border bg-black px-4 py-4 text-sm leading-7 text-synod-muted">
-                      1. Start your agent or `synod-mcp` so it generates a local keypair.
-                      <br />
-                      2. Copy the printed public key into this slot.
-                      <br />
-                      3. Sign the binding with your wallet.
-                      <br />
-                      4. Let the agent finish Synod Connect and open its WebSocket session.
-                    </div>
+                    <label className="text-[10px] font-bold uppercase tracking-[0.18em] text-synod-muted-dark">Agent Public Key</label>
+                    <input
+                      required
+                      type="text"
+                      value={newAgentPubKey}
+                      onChange={(event) => setNewAgentPubKey(event.target.value.trim())}
+                      placeholder="G..."
+                      className="h-12 w-full rounded-xl border border-synod-border bg-black px-4 font-mono text-[11px] text-white outline-none transition-colors placeholder:text-synod-muted-dark focus:border-white"
+                    />
                   </section>
+
+                  {modalError && <div className="rounded-xl border border-red-500/25 bg-red-500/10 px-4 py-3 text-xs text-red-200">{modalError}</div>}
                 </div>
 
-                <div className="flex justify-end px-6 pb-6">
+                <div className="flex justify-end gap-3 px-6 pb-6">
                   <button
                     type="button"
-                    onClick={resetProvisionModal}
-                    className="inline-flex h-12 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200"
+                    onClick={() => setProvisionStep("name")}
+                    className="inline-flex h-10 items-center justify-center rounded-lg border border-synod-border bg-transparent px-5 text-[11px] font-bold uppercase tracking-[0.16em] text-synod-muted transition-colors hover:text-white"
                   >
-                    Done
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleProvisionDone}
+                    disabled={isProvisioning || !newAgentPubKey.trim()}
+                    className="inline-flex h-10 items-center justify-center rounded-lg bg-white px-6 text-[11px] font-bold uppercase tracking-[0.16em] text-black transition-colors hover:bg-zinc-200 disabled:opacity-60"
+                  >
+                    {isProvisioning ? "Creating..." : "Done"}
                   </button>
                 </div>
               </div>
-            ) : null}
+            )}
           </div>
         </div>
       )}

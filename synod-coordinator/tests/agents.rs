@@ -14,7 +14,8 @@ use common::{
 async fn test_agent_slot_starts_pending_pubkey() {
     let ctx = setup_test_context().await;
     let treasury_id = create_treasury(&ctx, "Agent Treasury").await;
-    let agent_id = create_agent_slot(&ctx, treasury_id, "Test Agent").await;
+    let (_agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Test Agent", &agent_pubkey).await;
 
     let response = ctx.client
         .get(format!("{}/v1/agents/{}", ctx.base_url, treasury_id))
@@ -26,8 +27,8 @@ async fn test_agent_slot_starts_pending_pubkey() {
     assert_eq!(response.status(), StatusCode::OK);
     let agents: Vec<serde_json::Value> = response.json().await.unwrap();
     let agent = agents.iter().find(|item| item["agent_id"].as_str() == Some(&agent_id.to_string())).unwrap();
-    assert_eq!(agent["status"].as_str().unwrap(), "PENDING_PUBKEY");
-    assert!(agent["agent_pubkey"].is_null());
+    assert_eq!(agent["status"].as_str().unwrap(), "PENDING_CONFIGURATION");
+    assert_eq!(agent["agent_pubkey"].as_str().unwrap(), agent_pubkey);
 }
 
 #[serial_test::serial]
@@ -39,7 +40,7 @@ async fn test_pubkey_enrollment_and_connect_issue_session() {
     let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
 
     attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
-    let agent_id = create_agent_slot(&ctx, treasury_id, "Connect Agent").await;
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Connect Agent", &agent_pubkey).await;
 
     let enrolled = enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
     assert_eq!(enrolled["agent_pubkey"].as_str().unwrap(), agent_pubkey);
@@ -61,7 +62,7 @@ async fn test_connect_challenge_is_single_use() {
     let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
 
     attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
-    let agent_id = create_agent_slot(&ctx, treasury_id, "Replay Agent").await;
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Replay Agent", &agent_pubkey).await;
     enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
 
     let challenge_response = ctx.client
@@ -117,7 +118,7 @@ async fn test_websocket_requires_valid_ticket_and_accepts_ping() {
     let (agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
 
     attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
-    let agent_id = create_agent_slot(&ctx, treasury_id, "WS Agent").await;
+    let agent_id = create_agent_slot(&ctx, treasury_id, "WS Agent", &agent_pubkey).await;
     enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
     let connected = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
 
@@ -150,7 +151,7 @@ async fn test_suspended_agent_cannot_start_connect_challenge() {
     let (_agent_signing_key, agent_pubkey) = generate_test_stellar_keypair();
 
     attach_active_wallet(&ctx, treasury_id, &wallet_address).await;
-    let agent_id = create_agent_slot(&ctx, treasury_id, "Suspended Agent").await;
+    let agent_id = create_agent_slot(&ctx, treasury_id, "Suspended Agent", &agent_pubkey).await;
     enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
 
     let suspend_response = ctx.client

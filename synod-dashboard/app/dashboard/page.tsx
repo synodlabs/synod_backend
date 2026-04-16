@@ -22,13 +22,6 @@ import { AgentManager, type AgentSlot } from "@/components/dashboard/agent-manag
 import { PolicyManager } from "@/components/dashboard/policy-manager"
 import { Button } from "@/components/ui/button"
 
-interface Pool {
-  pool_key: string;
-  asset_code: string;
-  target_pct: number;
-  current_balance?: number;
-}
-
 interface Wallet {
   wallet_address: string;
   label: string | null;
@@ -43,7 +36,6 @@ interface TreasuryState {
   current_aum_usd: number;
   peak_aum_usd: number;
   network: string;
-  pools: Pool[];
   wallets: Wallet[];
 }
 
@@ -89,7 +81,7 @@ export default function DashboardPage() {
 
     try {
       const res = await fetch(`/v1/agents/${treasuryId}`, {
-        headers: { 'Authorization': `Bearer ${authToken}` }
+        cache: 'no-store',
       })
 
       if (!res.ok) throw new Error("Failed to fetch agents")
@@ -106,7 +98,7 @@ export default function DashboardPage() {
     setLoading(true)
     try {
       const res1 = await fetch('/v1/dashboard', {
-        headers: { 'Authorization': `Bearer ${token}` }
+        cache: 'no-store',
       })
       if (!res1.ok) throw new Error("Failed to fetch dashboard list")
       const dashData = await res1.json()
@@ -114,7 +106,7 @@ export default function DashboardPage() {
       if (Array.isArray(dashData) && dashData.length > 0) {
         const id = dashData[0].treasury_id;
         const res2 = await fetch(`/v1/dashboard/${id}`, {
-          headers: { 'Authorization': `Bearer ${token}` }
+          cache: 'no-store',
         })
         if (!res2.ok) throw new Error("Failed to fetch treasury state")
         const stateData = await res2.json()
@@ -198,7 +190,6 @@ export default function DashboardPage() {
     try {
       await fetch(`/v1/treasuries/${state.treasury_id}/resync`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
       });
     } catch (e) {
       console.error(e);
@@ -212,7 +203,6 @@ export default function DashboardPage() {
       const res = await fetch('/v1/treasuries', {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -313,50 +303,7 @@ export default function DashboardPage() {
                       isDashboardWidget={true}
                     />
 
-                    <section className="bg-synod-card border border-synod-border rounded-md">
-                      <div className="p-5 border-b border-synod-border">
-                        <h2 className="text-sm font-bold text-white">Signal Feed</h2>
-                      </div>
-                      <div className="divide-y divide-synod-border">
-                        {events.length === 0 ? (
-                          <div className="p-12 text-center text-synod-muted text-xs font-mono">Awaiting coordination signals...</div>
-                        ) : (
-                          events.map((ev, i) => (
-                            <EventRow key={i} event={ev} />
-                          ))
-                        )}
-                      </div>
-                    </section>
-                  </div>
 
-                  {/* Right Column: Drawdown & Pool Allocations */}
-                  <div className="space-y-6">
-                    <section className="bg-synod-card border border-synod-border rounded-md p-6">
-                      <div className="flex justify-between items-end mb-4">
-                        <h3 className="text-[11px] font-bold uppercase tracking-widest text-synod-muted">Drawdown Monitor</h3>
-                        <span className="text-xs font-mono font-bold text-synod-warning">8.4%</span>
-                      </div>
-                      <div className="h-2 bg-zinc-900 rounded-full overflow-hidden relative">
-                        <div className="h-full bg-white w-[42%] rounded-full transition-all duration-1000" />
-                        <div className="absolute right-[20%] top-0 bottom-0 w-[1px] bg-red-400 opacity-50" />
-                      </div>
-                      <p className="text-[9px] text-synod-muted mt-4 leading-relaxed">
-                        Limit: 20% · Auto-halt active. <br />
-                        Peak AUM: ${state.peak_aum_usd.toLocaleString()}
-                      </p>
-                    </section>
-
-                    <section className="bg-synod-card border border-synod-border rounded-md">
-                      <div className="p-5 border-b border-synod-border flex justify-between items-center">
-                        <h2 className="text-[11px] font-bold uppercase tracking-widest text-synod-muted">Pool Allocations</h2>
-                        <button className="text-[9px] font-bold uppercase tracking-widest text-synod-muted hover:text-white transition-colors" onClick={() => setActiveTab('policy')}>Rules →</button>
-                      </div>
-                      <div className="p-6 space-y-6">
-                        {state.pools.map(pool => (
-                          <PoolItem key={pool.pool_key} pool={pool} />
-                        ))}
-                      </div>
-                    </section>
                   </div>
                 </div>
               </div>
@@ -480,37 +427,6 @@ function KPICard({ label, value, change, trend, isLoading, isCurrency }: KPICard
   )
 }
 
-function PoolItem({ pool }: { pool: Pool }) {
-  const currentPct = 52.4; // Mock for now, would be computed
-  return (
-    <div className="group">
-      <div className="flex justify-between items-end mb-2">
-        <div>
-          <span className="text-[13px] font-bold text-white tracking-tight">{pool.asset_code}</span>
-          <span className="ml-2 text-[9px] font-mono text-synod-muted uppercase tracking-widest">{pool.pool_key}</span>
-        </div>
-        <div className="text-right">
-          <span className="text-xs font-mono font-bold text-white">{currentPct}%</span>
-          <span className="ml-2 text-[10px] font-mono text-synod-muted-dark tracking-tighter">/ target {pool.target_pct}%</span>
-        </div>
-      </div>
-      <div className="h-1.5 bg-zinc-900 rounded-full overflow-visible relative">
-        <div
-          className="h-full bg-white rounded-full transition-all duration-700"
-          style={{ width: `${currentPct}%` }}
-        />
-        <div
-          className="absolute top-1/2 -translate-y-1/2 w-[2px] h-3 bg-zinc-700 rounded-full border border-black"
-          style={{ left: `${pool.target_pct}%` }}
-        />
-      </div>
-      <div className="flex gap-4 mt-3">
-        <span className="text-[9px] font-mono text-synod-muted-dark uppercase tracking-widest">Drift <span className="text-white">+2.4%</span></span>
-        <span className="text-[9px] font-mono text-synod-muted-dark uppercase tracking-widest">Value <span className="text-white">$130,244</span></span>
-      </div>
-    </div>
-  )
-}
 
 function EventRow({ event }: { event: any }) {
   const typeStr = event?.event_type || event?.type || (typeof event === 'object' ? Object.keys(event)[0] : "EVENT");
