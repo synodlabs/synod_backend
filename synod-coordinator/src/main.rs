@@ -11,6 +11,39 @@ use tokio::sync::Mutex;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+fn is_local_connection(url: &str) -> bool {
+    let normalized = url.trim().to_ascii_lowercase();
+    normalized.contains("localhost")
+        || normalized.contains("127.0.0.1")
+        || normalized.contains("@postgres:5432")
+        || normalized.contains("@redis:6379")
+}
+
+fn validate_hosted_runtime_config(settings: &Settings) -> anyhow::Result<()> {
+    let is_hosted_runtime = std::env::var("PORT")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+
+    if !is_hosted_runtime {
+        return Ok(());
+    }
+
+    if is_local_connection(&settings.database.url) {
+        anyhow::bail!(
+            "DATABASE_URL is still pointing to a local address. In Render, set DATABASE_URL to your Render Postgres internal connection string."
+        );
+    }
+
+    if is_local_connection(&settings.redis.url) {
+        anyhow::bail!(
+            "REDIS_URL is still pointing to a local address. In Render, set REDIS_URL to your Render Key Value internal connection string."
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -62,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
             },
         }
     });
+
+    validate_hosted_runtime_config(&settings)?;
 
     // Connect to Postgres
     info!("Connecting to Postgres...");
