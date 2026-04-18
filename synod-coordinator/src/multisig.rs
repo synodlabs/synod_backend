@@ -7,6 +7,7 @@ use axum::{
 };
 use ed25519_dalek::Verifier;
 use serde::Serialize;
+use sqlx::Row;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -28,25 +29,21 @@ pub async fn get_multisig_setup(
     Path(treasury_id): Path<Uuid>,
 ) -> AppResult<Json<MultisigSetupResponse>> {
     // 1. Verify ownership
-    let treasury = sqlx::query!(
-        "SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2",
-        treasury_id,
-        auth.user_id
-    )
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or(AppError::NotFound("Treasury not found".into()))?;
+    let treasury = sqlx::query("SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2")
+        .bind(treasury_id)
+        .bind(auth.user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound("Treasury not found".into()))?;
 
     // 2. Get the primary wallet for this treasury
-    let wallet = sqlx::query!(
-        "SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 LIMIT 1",
-        treasury.treasury_id
-    )
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or(AppError::NotFound(
-        "No wallet connected to this treasury".into(),
-    ))?;
+    let wallet = sqlx::query("SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 LIMIT 1")
+        .bind(treasury.get::<Uuid, _>("treasury_id"))
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound(
+            "No wallet connected to this treasury".into(),
+        ))?;
 
     // 3. Construct SetOptions XDR
     // We add the coordinator as a signer with weight 20
@@ -61,7 +58,7 @@ pub async fn get_multisig_setup(
     }
 
     let xdr = stellar::construct_set_options_xdr(
-        &wallet.wallet_address,
+        &wallet.get::<String, _>("wallet_address"),
         coordinator_pubkey,
         20, // weight
     )?;
@@ -78,22 +75,20 @@ pub async fn confirm_multisig(
     Path(treasury_id): Path<Uuid>,
 ) -> AppResult<Json<MultisigStatusResponse>> {
     // 1. Verify ownership
-    let _ = sqlx::query!(
-        "SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2",
-        treasury_id,
-        auth.user_id
-    )
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or(AppError::NotFound("Treasury not found".into()))?;
+    let _ = sqlx::query("SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2")
+        .bind(treasury_id)
+        .bind(auth.user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound("Treasury not found".into()))?;
 
     // 2. Update status and mark multisig as active
-    sqlx::query!(
+    sqlx::query(
         "UPDATE treasury_wallets 
          SET multisig_active = true, status = 'ACTIVE' 
          WHERE treasury_id = $1 AND status IN ('PENDING', 'SYNCING')",
-        treasury_id
     )
+    .bind(treasury_id)
     .execute(&state.db)
     .await?;
 
@@ -122,12 +117,12 @@ pub async fn revoke_multisig(
     Json(payload): Json<RevokeRequest>,
 ) -> AppResult<Json<MultisigStatusResponse>> {
     // 1. Verify ownership & link
-    let wallet = sqlx::query!(
+    let wallet = sqlx::query(
         "SELECT wallet_address FROM treasury_wallets 
          WHERE treasury_id = $1 AND wallet_address = $2",
-        treasury_id,
-        payload.wallet_address
     )
+    .bind(treasury_id)
+    .bind(&payload.wallet_address)
     .fetch_optional(&state.db)
     .await?
     .ok_or(AppError::NotFound(
@@ -138,14 +133,14 @@ pub async fn revoke_multisig(
     if payload.xdr == "OFF_CHAIN_BYPASS" {
         info!(
             "Bypass requested: Cleaning up database record for wallet {}",
-            wallet.wallet_address
+            wallet.get::<String, _>("wallet_address")
         );
-        sqlx::query!(
+        sqlx::query(
             "DELETE FROM treasury_wallets 
              WHERE treasury_id = $1 AND wallet_address = $2",
-            treasury_id,
-            wallet.wallet_address
         )
+        .bind(treasury_id)
+        .bind(wallet.get::<String, _>("wallet_address"))
         .execute(&state.db)
         .await?;
 
@@ -181,7 +176,8 @@ pub async fn revoke_multisig(
     let candidate_hashes = crate::stellar::calculate_tx_v1_hashes(&raw_env, clean_passphrase)?;
 
     // CRYPTO SELF-TEST: Verify the user's signature
-    let user_pk_bytes = crate::stellar::decode_stellar_address(&wallet.wallet_address)?;
+    let wallet_address = wallet.get::<String, _>("wallet_address");
+    let user_pk_bytes = crate::stellar::decode_stellar_address(&wallet_address)?;
     let user_verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&user_pk_bytes)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Invalid VerifyingKey: {}", e)))?;
 
@@ -260,7 +256,7 @@ pub async fn revoke_multisig(
 
     info!(
         "Submitting co-signed revocation to Stellar for wallet: {}",
-        wallet.wallet_address
+        wallet_address
     );
     let horizon_url = &state.config.stellar.horizon_url;
     let client = reqwest::Client::new();
@@ -281,12 +277,12 @@ pub async fn revoke_multisig(
     }
 
     // 4. Mark as inactive in DB and delete (as requested "remove everything")
-    sqlx::query!(
+    sqlx::query(
         "DELETE FROM treasury_wallets 
          WHERE treasury_id = $1 AND wallet_address = $2",
-        treasury_id,
-        wallet.wallet_address
     )
+    .bind(treasury_id)
+    .bind(&wallet_address)
     .execute(&state.db)
     .await?;
 
@@ -303,12 +299,12 @@ pub async fn approve_signer(
     Json(payload): Json<ApproveSignerRequest>,
 ) -> AppResult<Json<MultisigStatusResponse>> {
     // 1. Verify membership/ownership (already done via treasury_id path & auth)
-    let wallet = sqlx::query!(
+    let wallet = sqlx::query(
         "SELECT wallet_address FROM treasury_wallets 
          WHERE treasury_id = $1 AND wallet_address = $2",
-        treasury_id,
-        payload.wallet_address
     )
+    .bind(treasury_id)
+    .bind(&payload.wallet_address)
     .fetch_optional(&state.db)
     .await?
     .ok_or(AppError::NotFound(
@@ -340,7 +336,8 @@ pub async fn approve_signer(
     let candidate_hashes = crate::stellar::calculate_tx_v1_hashes(&raw_env, clean_passphrase)?;
 
     // Verify user signature
-    let user_pk_bytes = crate::stellar::decode_stellar_address(&wallet.wallet_address)?;
+    let wallet_address = wallet.get::<String, _>("wallet_address");
+    let user_pk_bytes = crate::stellar::decode_stellar_address(&wallet_address)?;
     let user_verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&user_pk_bytes)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Invalid VerifyingKey: {}", e)))?;
 

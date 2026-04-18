@@ -147,11 +147,11 @@ pub async fn check_verified(
     auth: AuthUser,
     Json(payload): Json<NonceRequest>,
 ) -> AppResult<Json<VerifyOwnershipResponse>> {
-    let exists = sqlx::query!(
-        "SELECT 1 as id FROM wallet_connections WHERE user_id = $1 AND wallet_address = $2 AND status = 'ACTIVE'",
-        auth.user_id,
-        payload.wallet_address
+    let exists = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM wallet_connections WHERE user_id = $1 AND wallet_address = $2 AND status = 'ACTIVE'",
     )
+    .bind(auth.user_id)
+    .bind(&payload.wallet_address)
     .fetch_optional(&state.db)
     .await?
     .is_some();
