@@ -101,6 +101,24 @@ impl Settings {
             }
         }
 
+        if let Ok(network_passphrase) = env::var("SYNOD_STELLAR__NETWORK_PASSPHRASE") {
+            if !network_passphrase.trim().is_empty() {
+                self.stellar.network_passphrase = network_passphrase;
+            }
+        }
+
+        if let Ok(coordinator_pubkey) = env::var("SYNOD_STELLAR__COORDINATOR_PUBKEY") {
+            if !coordinator_pubkey.trim().is_empty() {
+                self.stellar.coordinator_pubkey = coordinator_pubkey;
+            }
+        }
+
+        if let Ok(coordinator_secret_key) = env::var("SYNOD_STELLAR__COORDINATOR_SECRET_KEY") {
+            if !coordinator_secret_key.trim().is_empty() {
+                self.stellar.coordinator_secret_key = coordinator_secret_key;
+            }
+        }
+
         if let Ok(jwt_secret) = env::var("JWT_SECRET") {
             if !jwt_secret.trim().is_empty() {
                 self.auth.jwt_secret = jwt_secret;
@@ -134,3 +152,4 @@ impl Default for RedisConfig {
         }
     }
 }
+
