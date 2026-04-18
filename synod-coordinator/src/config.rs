@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::env;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
@@ -57,8 +58,53 @@ impl Settings {
             .add_source(config::Environment::with_prefix("SYNOD").separator("__"))
             .build()?;
 
-        let settings: Settings = config.try_deserialize()?;
+        let mut settings: Settings = config.try_deserialize()?;
+        settings.apply_runtime_env_overrides();
         Ok(settings)
+    }
+
+    fn apply_runtime_env_overrides(&mut self) {
+        if let Ok(port) = env::var("PORT") {
+            if let Ok(parsed) = port.parse::<u16>() {
+                self.server.port = parsed;
+            }
+        }
+
+        if let Ok(host) = env::var("HOST") {
+            if !host.trim().is_empty() {
+                self.server.host = host;
+            }
+        }
+
+        if let Ok(url) = env::var("DATABASE_URL") {
+            if !url.trim().is_empty() {
+                self.database.url = url;
+            }
+        }
+
+        if let Ok(url) = env::var("REDIS_URL") {
+            if !url.trim().is_empty() {
+                self.redis.url = url;
+            }
+        }
+
+        if let Ok(network) = env::var("STELLAR_NETWORK") {
+            if !network.trim().is_empty() {
+                self.stellar.network = network;
+            }
+        }
+
+        if let Ok(horizon_url) = env::var("HORIZON_URL") {
+            if !horizon_url.trim().is_empty() {
+                self.stellar.horizon_url = horizon_url;
+            }
+        }
+
+        if let Ok(jwt_secret) = env::var("JWT_SECRET") {
+            if !jwt_secret.trim().is_empty() {
+                self.auth.jwt_secret = jwt_secret;
+            }
+        }
     }
 }
 

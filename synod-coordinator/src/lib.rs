@@ -1,28 +1,28 @@
-pub mod config;
-pub mod error;
-pub mod auth;
-pub mod wallet;
-pub mod treasury;
-pub mod stellar;
-pub mod horizon;
-pub mod resync;
-pub mod constitution;
-pub mod proposal;
 pub mod agent;
-pub mod policy;
-pub mod permit;
+pub mod auth;
+pub mod config;
+pub mod constitution;
 pub mod dashboard;
-pub mod multisig;
+pub mod error;
+pub mod horizon;
 pub mod mcp;
+pub mod multisig;
+pub mod permit;
+pub mod policy;
+pub mod proposal;
+pub mod resync;
+pub mod stellar;
+pub mod treasury;
+pub mod wallet;
 
 use redis::aio::ConnectionManager;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use uuid::Uuid;
-use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 /// Unified event envelope sent over WebSocket to all consumers.
 /// Every event has an `event_type` in SCREAMING_SNAKE_CASE and a `payload` object.
@@ -134,23 +134,45 @@ impl TreasuryEvent {
     /// Convert to a unified EventEnvelope with SCREAMING_SNAKE event_type.
     pub fn to_envelope(&self) -> EventEnvelope {
         let (event_type, payload) = match self {
-            TreasuryEvent::WalletBalanceUpdate { treasury_id, wallet_address, amount, asset_code } => (
+            TreasuryEvent::WalletBalanceUpdate {
+                treasury_id,
+                wallet_address,
+                amount,
+                asset_code,
+            } => (
                 "WALLET_BALANCE_UPDATE",
                 serde_json::json!({ "treasury_id": treasury_id, "wallet_address": wallet_address, "amount": amount, "asset_code": asset_code }),
             ),
-            TreasuryEvent::ConstitutionUpdate { treasury_id, version } => (
+            TreasuryEvent::ConstitutionUpdate {
+                treasury_id,
+                version,
+            } => (
                 "CONSTITUTION_UPDATE",
                 serde_json::json!({ "treasury_id": treasury_id, "version": version }),
             ),
-            TreasuryEvent::PermitIssued { treasury_id, agent_id, permit_id, wallet_address, approved_amount } => (
+            TreasuryEvent::PermitIssued {
+                treasury_id,
+                agent_id,
+                permit_id,
+                wallet_address,
+                approved_amount,
+            } => (
                 "PERMIT_ISSUED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "permit_id": permit_id, "wallet_address": wallet_address, "approved_amount": approved_amount }),
             ),
-            TreasuryEvent::PermitConsumed { treasury_id, permit_id, wallet_address } => (
+            TreasuryEvent::PermitConsumed {
+                treasury_id,
+                permit_id,
+                wallet_address,
+            } => (
                 "PERMIT_CONSUMED",
                 serde_json::json!({ "treasury_id": treasury_id, "permit_id": permit_id, "wallet_address": wallet_address }),
             ),
-            TreasuryEvent::PermitExpired { treasury_id, permit_id, wallet_address } => (
+            TreasuryEvent::PermitExpired {
+                treasury_id,
+                permit_id,
+                wallet_address,
+            } => (
                 "PERMIT_EXPIRED",
                 serde_json::json!({ "treasury_id": treasury_id, "permit_id": permit_id, "wallet_address": wallet_address }),
             ),
@@ -162,35 +184,68 @@ impl TreasuryEvent {
                 "TREASURY_RESUMED",
                 serde_json::json!({ "treasury_id": treasury_id }),
             ),
-            TreasuryEvent::AgentSuspended { treasury_id, agent_id } => (
+            TreasuryEvent::AgentSuspended {
+                treasury_id,
+                agent_id,
+            } => (
                 "AGENT_SUSPENDED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id }),
             ),
-            TreasuryEvent::AgentStatusChanged { treasury_id, agent_id, new_status } => (
+            TreasuryEvent::AgentStatusChanged {
+                treasury_id,
+                agent_id,
+                new_status,
+            } => (
                 "AGENT_STATUS_CHANGED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "new_status": new_status }),
             ),
-            TreasuryEvent::AgentConnected { treasury_id, agent_id } => (
+            TreasuryEvent::AgentConnected {
+                treasury_id,
+                agent_id,
+            } => (
                 "AGENT_CONNECTED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id }),
             ),
-            TreasuryEvent::AgentSignerAdded { treasury_id, agent_id, wallet_address, tx_hash } => (
+            TreasuryEvent::AgentSignerAdded {
+                treasury_id,
+                agent_id,
+                wallet_address,
+                tx_hash,
+            } => (
                 "AGENT_SIGNER_ADDED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "wallet_address": wallet_address, "tx_hash": tx_hash }),
             ),
-            TreasuryEvent::AgentActivated { treasury_id, agent_id } => (
+            TreasuryEvent::AgentActivated {
+                treasury_id,
+                agent_id,
+            } => (
                 "AGENT_ACTIVATED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id }),
             ),
-            TreasuryEvent::IntentConfirmed { treasury_id, agent_id, intent_id, tx_hash } => (
+            TreasuryEvent::IntentConfirmed {
+                treasury_id,
+                agent_id,
+                intent_id,
+                tx_hash,
+            } => (
                 "INTENT_CONFIRMED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "tx_hash": tx_hash }),
             ),
-            TreasuryEvent::IntentRejected { treasury_id, agent_id, intent_id, reason } => (
+            TreasuryEvent::IntentRejected {
+                treasury_id,
+                agent_id,
+                intent_id,
+                reason,
+            } => (
                 "INTENT_REJECTED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "reason": reason }),
             ),
-            TreasuryEvent::IntentFailed { treasury_id, agent_id, intent_id, reason } => (
+            TreasuryEvent::IntentFailed {
+                treasury_id,
+                agent_id,
+                intent_id,
+                reason,
+            } => (
                 "INTENT_FAILED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id, "intent_id": intent_id, "reason": reason }),
             ),
@@ -215,7 +270,10 @@ pub struct AppState {
     pub watcher_handles: WatcherHandles,
 }
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 
 pub fn router(state: AppState) -> Router {
     let treasury_v1 = Router::new()
@@ -226,6 +284,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(root))
+        .route("/health", get(health))
         .merge(mcp::router())
         .nest("/v1/auth", auth::router())
         .nest("/v1/treasuries", treasury_v1)
@@ -241,6 +300,14 @@ pub fn router(state: AppState) -> Router {
 async fn root() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "status": "ok",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+async fn health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "status": "healthy",
+        "service": "synod-coordinator",
         "version": env!("CARGO_PKG_VERSION")
     }))
 }

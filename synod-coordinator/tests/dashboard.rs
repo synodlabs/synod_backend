@@ -1,8 +1,8 @@
-use reqwest::StatusCode;
-use uuid::Uuid;
 use crate::common::setup_test_context;
-use tokio_tungstenite::connect_async;
 use http::Request;
+use reqwest::StatusCode;
+use tokio_tungstenite::connect_async;
+use uuid::Uuid;
 
 mod common;
 
@@ -15,13 +15,16 @@ async fn test_phase_10_dashboard_and_ws() {
     let auth_header = format!("Bearer {}", ctx.user_token);
 
     // 1. Create Treasury
-    let treasury_resp = client.post(format!("{}/v1/treasuries", base_url))
+    let treasury_resp = client
+        .post(format!("{}/v1/treasuries", base_url))
         .header("Authorization", &auth_header)
         .json(&serde_json::json!({
             "name": "Dashboard Test Treasury",
             "network": "testnet"
         }))
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     let treasury_data: serde_json::Value = treasury_resp.json().await.unwrap();
     let treasury_id = treasury_data["treasury_id"].as_str().unwrap();
     let treasury_uuid = Uuid::parse_str(treasury_id).unwrap();
@@ -41,17 +44,23 @@ async fn test_phase_10_dashboard_and_ws() {
     .execute(&ctx.db).await.unwrap();
 
     // 3. Test REST API: List Treasuries
-    let list_resp = client.get(format!("{}/v1/dashboard", base_url))
+    let list_resp = client
+        .get(format!("{}/v1/dashboard", base_url))
         .header("Authorization", &auth_header)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_data: Vec<serde_json::Value> = list_resp.json().await.unwrap();
     assert!(list_data.iter().any(|t| t["treasury_id"] == treasury_id));
 
     // 4. Test REST API: Get Treasury State
-    let state_resp = client.get(format!("{}/v1/dashboard/{}", base_url, treasury_id))
+    let state_resp = client
+        .get(format!("{}/v1/dashboard/{}", base_url, treasury_id))
         .header("Authorization", &auth_header)
-        .send().await.unwrap();
+        .send()
+        .await
+        .unwrap();
     assert_eq!(state_resp.status(), StatusCode::OK);
     let state_data: serde_json::Value = state_resp.json().await.unwrap();
     assert_eq!(state_data["name"], "Dashboard Test Treasury");
@@ -60,19 +69,24 @@ async fn test_phase_10_dashboard_and_ws() {
     // 5. Test WebSocket Connection
     let ws_url = base_url.replace("http://", "ws://") + "/v1/dashboard/ws";
     let host = base_url.replace("http://", "");
-    
+
     let request = Request::builder()
         .uri(&ws_url)
         .header("Host", host)
         .header("Authorization", &auth_header)
-        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .header(
+            "Sec-WebSocket-Key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        )
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
         .body(())
         .unwrap();
 
-    let (_ws_stream, _) = connect_async(request).await.expect("Failed to connect to WS");
+    let (_ws_stream, _) = connect_async(request)
+        .await
+        .expect("Failed to connect to WS");
 
     // 6. WS handshake success is enough for this integration test.
 }

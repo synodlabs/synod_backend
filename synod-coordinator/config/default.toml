@@ -14,6 +14,7 @@ network = "testnet"
 network_passphrase = "Test SDF Network ; September 2015"
 horizon_url = "https://horizon-testnet.stellar.org"
 coordinator_pubkey = ""
+coordinator_secret_key = ""
 coordinator_secret_key_path = ""
 
 [auth]

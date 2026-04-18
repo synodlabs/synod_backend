@@ -3,12 +3,12 @@ use redis::AsyncCommands;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // ── Constants ──
 const CURSOR_TTL_SECS: u64 = 604_800; // 7 days
-const DEDUP_TTL_SECS: u64 = 172_800;  // 48 hours
+const DEDUP_TTL_SECS: u64 = 172_800; // 48 hours
 const DEDUP_MAX_ENTRIES: usize = 2_000;
 const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 const MAX_BACKOFF_SECS: u64 = 60;
@@ -28,7 +28,11 @@ fn dedup_key(wallet: &str) -> String {
 pub enum ReconnectStrategy {
     Immediate,
     FixedDelay(Duration),
-    ExponentialBackoff { attempt: u32, base_secs: u64, max_secs: u64 },
+    ExponentialBackoff {
+        attempt: u32,
+        base_secs: u64,
+        max_secs: u64,
+    },
     RetryAfter(Duration),
     PermanentPause,
 }
@@ -92,7 +96,7 @@ pub enum InflowResult {
 pub fn classify_inflow(
     op: &HorizonOperation,
     wallet_address: &str,
-    monitored_assets: &[String], 
+    monitored_assets: &[String],
 ) -> InflowResult {
     // Step 1: Is operation type payment, path_payment, or create_account?
     let valid_types = ["payment", "path_payment_strict_receive", "create_account"];
@@ -146,7 +150,8 @@ impl HorizonWatcher {
     pub async fn get_cursor(&self) -> String {
         let mut redis = self.state.redis.clone();
         let key = cursor_key(&self.wallet_address);
-        redis.get::<_, Option<String>>(&key)
+        redis
+            .get::<_, Option<String>>(&key)
             .await
             .unwrap_or(None)
             .unwrap_or_else(|| "now".to_string())
@@ -162,9 +167,7 @@ impl HorizonWatcher {
     pub async fn is_duplicate(&self, operation_id: &str) -> bool {
         let mut redis = self.state.redis.clone();
         let key = dedup_key(&self.wallet_address);
-        redis.sismember(&key, operation_id)
-            .await
-            .unwrap_or(false)
+        redis.sismember(&key, operation_id).await.unwrap_or(false)
     }
 
     pub async fn mark_seen(&self, operation_id: &str) {
@@ -215,12 +218,15 @@ impl HorizonWatcher {
                     asset = %asset_code,
                     "Treasury inflow detected"
                 );
-                let _ = self.state.tx_events.send(crate::TreasuryEvent::WalletBalanceUpdate {
-                    treasury_id: self.treasury_id,
-                    wallet_address: self.wallet_address.clone(),
-                    amount: amount.parse().unwrap_or(0.0),
-                    asset_code: asset_code.clone(),
-                });
+                let _ = self
+                    .state
+                    .tx_events
+                    .send(crate::TreasuryEvent::WalletBalanceUpdate {
+                        treasury_id: self.treasury_id,
+                        wallet_address: self.wallet_address.clone(),
+                        amount: amount.parse().unwrap_or(0.0),
+                        asset_code: asset_code.clone(),
+                    });
             }
         }
     }
@@ -242,13 +248,15 @@ impl HorizonWatcher {
                 Ok(reason) => {
                     info!(wallet = %self.wallet_address, reason = ?reason, "Stream disconnected");
                     let strategy = reason.strategy(self.consecutive_failures);
-                    
+
                     if reason == DisconnectReason::AccountDeleted {
                         error!(wallet = %self.wallet_address, "Account deleted, pausing permanently");
                         break;
                     }
 
-                    if reason == DisconnectReason::CleanEof || reason == DisconnectReason::SilentDrop {
+                    if reason == DisconnectReason::CleanEof
+                        || reason == DisconnectReason::SilentDrop
+                    {
                         self.consecutive_failures = 0;
                     } else {
                         self.consecutive_failures += 1;
@@ -257,7 +265,11 @@ impl HorizonWatcher {
                     match strategy {
                         ReconnectStrategy::Immediate => {}
                         ReconnectStrategy::FixedDelay(d) => sleep(d).await,
-                        ReconnectStrategy::ExponentialBackoff { attempt, base_secs, max_secs } => {
+                        ReconnectStrategy::ExponentialBackoff {
+                            attempt,
+                            base_secs,
+                            max_secs,
+                        } => {
                             let delay = std::cmp::min(base_secs * 2u64.pow(attempt), max_secs);
                             sleep(Duration::from_secs(delay)).await;
                         }
@@ -268,7 +280,8 @@ impl HorizonWatcher {
                 Err(e) => {
                     error!(wallet = %self.wallet_address, error = %e, "Stream error");
                     self.consecutive_failures += 1;
-                    let delay = std::cmp::min(1 * 2u64.pow(self.consecutive_failures), MAX_BACKOFF_SECS);
+                    let delay =
+                        std::cmp::min(1 * 2u64.pow(self.consecutive_failures), MAX_BACKOFF_SECS);
                     sleep(Duration::from_secs(delay)).await;
                 }
             }
@@ -277,15 +290,12 @@ impl HorizonWatcher {
 
     async fn stream_events(&self, url: &str) -> Result<DisconnectReason, anyhow::Error> {
         use futures::StreamExt;
-        use reqwest_eventsource::{EventSource, Event};
+        use reqwest_eventsource::{Event, EventSource};
 
         let mut es = EventSource::get(url);
 
         loop {
-            let event = timeout(
-                Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
-                es.next(),
-            ).await;
+            let event = timeout(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS), es.next()).await;
 
             match event {
                 Err(_) => {
@@ -297,37 +307,35 @@ impl HorizonWatcher {
                     // Stream ended cleanly
                     return Ok(DisconnectReason::CleanEof);
                 }
-                Ok(Some(result)) => {
-                    match result {
-                        Ok(Event::Open) => {
-                            debug!(wallet = %self.wallet_address, "SSE stream opened");
-                        }
-                        Ok(Event::Message(msg)) => {
-                            if msg.event == "message" {
-                                match serde_json::from_str::<HorizonOperation>(&msg.data) {
-                                    Ok(op) => self.process_operation(op).await,
-                                    Err(e) => {
-                                        warn!(wallet = %self.wallet_address, error = %e, "Failed to parse operation");
-                                    }
+                Ok(Some(result)) => match result {
+                    Ok(Event::Open) => {
+                        debug!(wallet = %self.wallet_address, "SSE stream opened");
+                    }
+                    Ok(Event::Message(msg)) => {
+                        if msg.event == "message" {
+                            match serde_json::from_str::<HorizonOperation>(&msg.data) {
+                                Ok(op) => self.process_operation(op).await,
+                                Err(e) => {
+                                    warn!(wallet = %self.wallet_address, error = %e, "Failed to parse operation");
                                 }
                             }
                         }
-                        Err(reqwest_eventsource::Error::StreamEnded) => {
-                            return Ok(DisconnectReason::CleanEof);
-                        }
-                        Err(reqwest_eventsource::Error::InvalidStatusCode(code, _)) => {
-                            match code.as_u16() {
-                                429 => return Ok(DisconnectReason::RateLimited),
-                                503 => return Ok(DisconnectReason::HorizonDown),
-                                404 => return Ok(DisconnectReason::AccountDeleted),
-                                _ => return Err(anyhow::anyhow!("HTTP {}", code)),
-                            }
-                        }
-                        Err(e) => {
-                            return Err(anyhow::anyhow!("SSE error: {}", e));
+                    }
+                    Err(reqwest_eventsource::Error::StreamEnded) => {
+                        return Ok(DisconnectReason::CleanEof);
+                    }
+                    Err(reqwest_eventsource::Error::InvalidStatusCode(code, _)) => {
+                        match code.as_u16() {
+                            429 => return Ok(DisconnectReason::RateLimited),
+                            503 => return Ok(DisconnectReason::HorizonDown),
+                            404 => return Ok(DisconnectReason::AccountDeleted),
+                            _ => return Err(anyhow::anyhow!("HTTP {}", code)),
                         }
                     }
-                }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("SSE error: {}", e));
+                    }
+                },
             }
         }
     }
@@ -342,7 +350,10 @@ pub async fn spawn_watchers(state: AppState) {
     .await
     .unwrap_or_default();
 
-    info!(count = wallets.len(), "Spawning HorizonWatchers with staggered delay");
+    info!(
+        count = wallets.len(),
+        "Spawning HorizonWatchers with staggered delay"
+    );
 
     for (idx, (wallet_address, treasury_id)) in wallets.into_iter().enumerate() {
         let state_clone = state.clone();

@@ -39,12 +39,23 @@ async fn setup_halt_agent() -> (
         .unwrap();
 
     let agent_id = create_agent_slot(&ctx, treasury_id, "Halt Agent", &agent_pubkey).await;
-    enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
+    enroll_agent_pubkey(
+        &ctx,
+        agent_id,
+        &wallet_address,
+        &wallet_signing_key,
+        &agent_pubkey,
+    )
+    .await;
     let connect_data = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
     let session_token = connect_data["session_token"].as_str().unwrap().to_string();
 
-    let constitution_response = ctx.client
-        .post(format!("{}/v1/treasuries/{}/constitution", ctx.base_url, treasury_id))
+    let constitution_response = ctx
+        .client
+        .post(format!(
+            "{}/v1/treasuries/{}/constitution",
+            ctx.base_url, treasury_id
+        ))
         .header("Authorization", format!("Bearer {}", ctx.user_token))
         .json(&serde_json::json!({
             "content": {
@@ -87,8 +98,15 @@ async fn setup_halt_agent() -> (
 #[serial_test::serial]
 #[tokio::test]
 async fn test_phase_9_halt_and_resume() {
-    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
-        setup_halt_agent().await;
+    let (
+        ctx,
+        treasury_id,
+        agent_id,
+        wallet_address,
+        agent_signing_key,
+        agent_pubkey,
+        session_token,
+    ) = setup_halt_agent().await;
 
     let permit = PermitRequest {
         agent_id,
@@ -172,10 +190,17 @@ async fn test_phase_9_halt_and_resume() {
     assert_eq!(blocked.status(), StatusCode::OK);
     let blocked_body: serde_json::Value = blocked.json().await.unwrap();
     assert_eq!(blocked_body["approved"].as_bool().unwrap(), false);
-    assert_eq!(blocked_body["deny_reason"].as_str().unwrap(), "TREASURY_HALTED");
+    assert_eq!(
+        blocked_body["deny_reason"].as_str().unwrap(),
+        "TREASURY_HALTED"
+    );
 
-    let resume_response = ctx.client
-        .post(format!("{}/v1/treasuries/{}/resume", ctx.base_url, treasury_id))
+    let resume_response = ctx
+        .client
+        .post(format!(
+            "{}/v1/treasuries/{}/resume",
+            ctx.base_url, treasury_id
+        ))
         .header("Authorization", format!("Bearer {}", ctx.user_token))
         .send()
         .await

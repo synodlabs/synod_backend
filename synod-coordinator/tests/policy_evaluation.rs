@@ -1,6 +1,6 @@
-use synod_shared::models::*;
-use synod_coordinator::policy::run_policy_engine;
 use bigdecimal::BigDecimal;
+use synod_coordinator::policy::run_policy_engine;
+use synod_shared::models::*;
 use uuid::Uuid;
 
 fn mock_request(amount: i64) -> PermitRequest {
@@ -55,9 +55,17 @@ fn test_policy_full_approval() {
     let access = mock_access(1000);
     let constitution = mock_constitution();
     let reservations = BigDecimal::from(0);
-    
-    let result = run_policy_engine(&request, &treasury, &access, &constitution, &reservations, 0, 0);
-    
+
+    let result = run_policy_engine(
+        &request,
+        &treasury,
+        &access,
+        &constitution,
+        &reservations,
+        0,
+        0,
+    );
+
     assert!(result.approved);
     assert_eq!(result.approved_amount, BigDecimal::from(500));
     assert!(result.partial_reason.is_none());
@@ -69,9 +77,17 @@ fn test_policy_deny_early() {
     let treasury = mock_treasury(TreasuryHealth::Halted); // Rule 1 failure
     let access = mock_access(1000);
     let constitution = mock_constitution();
-    
-    let result = run_policy_engine(&request, &treasury, &access, &constitution, &BigDecimal::from(0), 0, 0);
-    
+
+    let result = run_policy_engine(
+        &request,
+        &treasury,
+        &access,
+        &constitution,
+        &BigDecimal::from(0),
+        0,
+        0,
+    );
+
     assert!(!result.approved);
     assert_eq!(result.deny_reason.unwrap(), "TREASURY_HALTED");
     assert_eq!(result.policy_check_number.unwrap(), 1);
@@ -83,9 +99,17 @@ fn test_policy_partial_approval_tier_limit() {
     let access = mock_access(1000); // Tier limit 1000
     let treasury = mock_treasury(TreasuryHealth::Healthy);
     let constitution = mock_constitution();
-    
-    let result = run_policy_engine(&request, &treasury, &access, &constitution, &BigDecimal::from(0), 0, 0);
-    
+
+    let result = run_policy_engine(
+        &request,
+        &treasury,
+        &access,
+        &constitution,
+        &BigDecimal::from(0),
+        0,
+        0,
+    );
+
     assert!(result.approved);
     assert_eq!(result.approved_amount, BigDecimal::from(1000));
     assert_eq!(result.partial_reason.unwrap(), "TIER_LIMIT_EXCEEDED");
@@ -97,13 +121,21 @@ fn test_policy_partial_approval_allocation() {
     let access = mock_access(10000); // 50% allocation, big tier
     let treasury = mock_treasury(TreasuryHealth::Healthy);
     let constitution = mock_constitution();
-    
+
     // wallet AUM = 10000, 50% allocation = 5000 max.
     // reservations = 0
     // headroom = 5000.
-    
-    let result = run_policy_engine(&request, &treasury, &access, &constitution, &BigDecimal::from(0), 0, 0);
-    
+
+    let result = run_policy_engine(
+        &request,
+        &treasury,
+        &access,
+        &constitution,
+        &BigDecimal::from(0),
+        0,
+        0,
+    );
+
     assert!(result.approved);
     assert_eq!(result.approved_amount, BigDecimal::from(5000));
     assert_eq!(result.partial_reason.unwrap(), "AGENT_ALLOCATION_REACHED");

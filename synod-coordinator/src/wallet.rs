@@ -1,11 +1,11 @@
+use crate::auth::AuthUser;
+use crate::error::{AppError, AppResult};
+use crate::{stellar, AppState};
 use axum::extract::State;
 use axum::{routing::post, Json, Router};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::error::{AppError, AppResult};
-use crate::{AppState, stellar};
-use crate::auth::AuthUser;
 
 #[derive(Debug, Deserialize)]
 pub struct NonceRequest {
@@ -49,7 +49,9 @@ pub async fn get_nonce(
     let nonce = Uuid::new_v4().to_string();
     let key = format!("nonce:{}", payload.wallet_address);
 
-    let _: () = redis_conn.set_ex(&key, &nonce, 600).await
+    let _: () = redis_conn
+        .set_ex(&key, &nonce, 600)
+        .await
         .map_err(|_| AppError::Internal(anyhow::anyhow!("Redis error")))?;
 
     Ok(Json(NonceResponse { nonce }))
@@ -67,25 +69,23 @@ pub async fn verify_ownership(
     if stored_nonce.is_none() || stored_nonce.unwrap() != payload.nonce {
         return Err(AppError::ChallengeExpired);
     }
-    
+
     // Consume nonce
     let _: redis::RedisResult<()> = redis_conn.del(&key).await;
 
     // Verify Ed25519 signature
     stellar::verify_stellar_signature(
-        &payload.wallet_address, 
-        payload.nonce.as_bytes(), 
+        &payload.wallet_address,
+        payload.nonce.as_bytes(),
         &payload.signature,
         &state.config.stellar.network_passphrase,
     )?;
-    
+
     // Update status to ACTIVE for any treasury using this wallet
-    sqlx::query(
-        "UPDATE treasury_wallets SET status = 'ACTIVE' WHERE wallet_address = $1"
-    )
-    .bind(&payload.wallet_address)
-    .execute(&state.db)
-    .await?;
+    sqlx::query("UPDATE treasury_wallets SET status = 'ACTIVE' WHERE wallet_address = $1")
+        .bind(&payload.wallet_address)
+        .execute(&state.db)
+        .await?;
 
     // Transition PENDING_WALLET treasuries to HEALTHY if they now have an active wallet
     sqlx::query(
@@ -127,11 +127,8 @@ pub async fn verify_ownership(
         let wallet_addr = payload.wallet_address.clone();
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
-            let mut watcher = crate::horizon::HorizonWatcher::new(
-                wallet_addr.clone(),
-                treasury_id,
-                state_clone,
-            );
+            let mut watcher =
+                crate::horizon::HorizonWatcher::new(wallet_addr.clone(), treasury_id, state_clone);
             watcher.run().await;
         });
 
@@ -170,7 +167,7 @@ pub async fn connect_wallet(
     sqlx::query(
         "UPDATE wallet_connections 
          SET wc_session_topic = $1, wc_session_expiry = $2, status = 'ACTIVE'
-         WHERE user_id = $3 AND wallet_address = $4"
+         WHERE user_id = $3 AND wallet_address = $4",
     )
     .bind(&payload.wc_session_topic)
     .bind(payload.wc_session_expiry)
@@ -182,9 +179,7 @@ pub async fn connect_wallet(
     Ok(Json(ConnectResponse { success: true }))
 }
 
-pub async fn heartbeat_wallet(
-    _auth: AuthUser,
-) -> AppResult<Json<serde_json::Value>> {
+pub async fn heartbeat_wallet(_auth: AuthUser) -> AppResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({ "status": "alive" })))
 }
 
@@ -196,7 +191,7 @@ pub async fn disconnect_wallet(
     sqlx::query(
         "UPDATE wallet_connections 
          SET status = 'DISCONNECTED', disconnected_at = $1
-         WHERE user_id = $2 AND wallet_address = $3"
+         WHERE user_id = $2 AND wallet_address = $3",
     )
     .bind(chrono::Utc::now())
     .bind(auth.user_id)

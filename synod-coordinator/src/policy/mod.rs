@@ -1,8 +1,8 @@
 pub mod rules;
 
-use synod_shared::models::*;
-use bigdecimal::BigDecimal;
 use self::rules::*;
+use bigdecimal::BigDecimal;
+use synod_shared::models::*;
 
 pub fn run_policy_engine(
     request: &PermitRequest,
@@ -33,7 +33,12 @@ pub fn run_policy_engine(
     }
 
     // Rule 4: Agent Allocation (Supports Partial)
-    match check_agent_allocation(request, agent_access, total_active_reservations_usd, &treasury_state.current_aum_usd) {
+    match check_agent_allocation(
+        request,
+        agent_access,
+        total_active_reservations_usd,
+        &treasury_state.current_aum_usd,
+    ) {
         Ok(limit) if limit < current_approved => {
             current_approved = limit;
             partial_reason = Some("AGENT_ALLOCATION_REACHED".to_string());

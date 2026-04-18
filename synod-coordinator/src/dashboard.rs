@@ -1,21 +1,24 @@
+use crate::auth::AuthUser;
+use crate::error::{AppError, AppResult};
+use crate::resync::WalletBalance;
+use crate::AppState;
 use axum::{
-    extract::{Path, State, ws::{WebSocket, WebSocketUpgrade, Message}},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::collections::HashSet;
 use uuid::Uuid;
-use crate::error::{AppResult, AppError};
-use crate::AppState;
-use crate::auth::AuthUser;
-use crate::resync::WalletBalance;
-use sqlx::Row;
 
 async fn user_owns_treasury(state: &AppState, user_id: Uuid, treasury_id: Uuid) -> AppResult<bool> {
     sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)"
+        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)",
     )
     .bind(treasury_id)
     .bind(user_id)
@@ -26,7 +29,7 @@ async fn user_owns_treasury(state: &AppState, user_id: Uuid, treasury_id: Uuid) 
 
 async fn owned_treasury_ids(state: &AppState, user_id: Uuid) -> AppResult<HashSet<Uuid>> {
     let ids = sqlx::query_scalar::<_, Uuid>(
-        "SELECT treasury_id FROM treasuries WHERE owner_user_id = $1"
+        "SELECT treasury_id FROM treasuries WHERE owner_user_id = $1",
     )
     .bind(user_id)
     .fetch_all(&state.db)
@@ -76,12 +79,15 @@ pub async fn list_treasuries(
     .fetch_all(&state.db)
     .await?;
 
-    let summaries = rows.into_iter().map(|r| TreasurySummary {
-        treasury_id: r.get(0),
-        name: r.get(1),
-        health: r.get(2),
-        current_aum_usd: r.get(3),
-    }).collect();
+    let summaries = rows
+        .into_iter()
+        .map(|r| TreasurySummary {
+            treasury_id: r.get(0),
+            name: r.get(1),
+            health: r.get(2),
+            current_aum_usd: r.get(3),
+        })
+        .collect();
 
     Ok(Json(summaries))
 }
@@ -105,7 +111,7 @@ pub async fn get_treasury_state(
 
     // Active permit count
     let active_permit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM permits WHERE treasury_id = $1 AND status = 'ACTIVE'"
+        "SELECT COUNT(*) FROM permits WHERE treasury_id = $1 AND status = 'ACTIVE'",
     )
     .bind(id)
     .fetch_one(&state.db)
@@ -121,8 +127,13 @@ pub async fn get_treasury_state(
     };
 
     // Max drawdown from constitution
-    let max_drawdown_pct = row.get::<Option<serde_json::Value>, _>(7)
-        .and_then(|v| v.get("treasury_rules").and_then(|tr| tr.get("max_drawdown_pct")).and_then(|d| d.as_f64()))
+    let max_drawdown_pct = row
+        .get::<Option<serde_json::Value>, _>(7)
+        .and_then(|v| {
+            v.get("treasury_rules")
+                .and_then(|tr| tr.get("max_drawdown_pct"))
+                .and_then(|d| d.as_f64())
+        })
         .unwrap_or(20.0);
 
     let wallets = sqlx::query(
@@ -132,14 +143,20 @@ pub async fn get_treasury_state(
     .fetch_all(&state.db)
     .await?;
 
-    let wallets_json = serde_json::to_value(wallets.into_iter().map(|r| {
-        serde_json::json!({
-            "wallet_address": r.get::<String, _>(0),
-            "label": r.get::<Option<String>, _>(1),
-            "multisig_active": r.get::<bool, _>(2),
-            "status": r.get::<String, _>(3),
-        })
-    }).collect::<Vec<_>>()).unwrap_or(serde_json::Value::Array(vec![]));
+    let wallets_json = serde_json::to_value(
+        wallets
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "wallet_address": r.get::<String, _>(0),
+                    "label": r.get::<Option<String>, _>(1),
+                    "multisig_active": r.get::<bool, _>(2),
+                    "status": r.get::<String, _>(3),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(serde_json::Value::Array(vec![]));
 
     Ok(Json(DashboardTreasuryState {
         treasury_id: row.get(0),
@@ -203,7 +220,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, auth: AuthUser) {
     let mut allowed_treasuries = owned_treasury_ids(&state, auth.user_id)
         .await
         .unwrap_or_default();
-    
+
     while let Ok(event) = rx.recv().await {
         let treasury_id = event.treasury_id();
 

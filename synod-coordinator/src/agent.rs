@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::auth::{load_agent_session, store_agent_session, AgentAuth, AgentSession, AuthUser};
 use crate::constitution::{
-    normalize_constitution_value, rules_for_agent,
-    AgentWalletRule as ConstitutionAgentWalletRule,
+    generate_state_hash, normalize_constitution_value, rules_for_agent,
+    AgentWalletRule as ConstitutionAgentWalletRule, ConstitutionContent,
 };
 use crate::error::{AppError, AppResult};
 use crate::stellar;
@@ -203,7 +203,11 @@ fn row_to_agent_slot(row: &sqlx::postgres::PgRow) -> AgentSlot {
     }
 }
 
-fn enrich_slot_with_status(slot: &mut AgentSlot, connection_phase: &str, reason_code: Option<&str>) {
+fn enrich_slot_with_status(
+    slot: &mut AgentSlot,
+    connection_phase: &str,
+    reason_code: Option<&str>,
+) {
     if matches!(slot.status.as_str(), "SUSPENDED" | "REVOKED" | "INACTIVE") {
         return;
     }
@@ -224,6 +228,102 @@ fn enrollment_challenge_key(agent_id: Uuid) -> String {
 
 fn connect_challenge_key(agent_pubkey: &str) -> String {
     format!("agent:connect:challenge:{}", agent_pubkey)
+}
+
+fn scrub_policy_memo_for_agent(memo: Option<String>, agent_id: Uuid) -> Option<String> {
+    let raw = memo?;
+    let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Some(raw);
+    };
+
+    if parsed.get("kind").and_then(|value| value.as_str()) != Some("synod-policy-meta/v1") {
+        return Some(raw);
+    }
+
+    if let Some(entries) = parsed
+        .get_mut("wallet_rule_meta")
+        .and_then(|value| value.as_array_mut())
+    {
+        let agent_id_str = agent_id.to_string();
+        entries.retain(|entry| {
+            entry.get("agent_id").and_then(|value| value.as_str()) != Some(agent_id_str.as_str())
+        });
+    }
+
+    let has_note = parsed
+        .get("note")
+        .map(|value| !value.is_null())
+        .unwrap_or(false);
+    let has_entries = parsed
+        .get("wallet_rule_meta")
+        .and_then(|value| value.as_array())
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false);
+
+    if !has_note && !has_entries {
+        return None;
+    }
+
+    serde_json::to_string(&parsed).ok().or(Some(raw))
+}
+
+async fn remove_agent_rules_from_constitution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    treasury_id: Uuid,
+    agent_id: Uuid,
+) -> AppResult<Option<(i32, ConstitutionContent)>> {
+    let current: Option<(i32, serde_json::Value)> = sqlx::query_as(
+        "SELECT version, content FROM constitution_history WHERE treasury_id = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(treasury_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let Some((current_version, content_json)) = current else {
+        return Ok(None);
+    };
+
+    let mut content = normalize_constitution_value(content_json)?;
+    let original_rule_count = content.agent_wallet_rules.len();
+    let original_memo = content.memo.clone();
+    content
+        .agent_wallet_rules
+        .retain(|rule| rule.agent_id != agent_id);
+    content.memo = scrub_policy_memo_for_agent(content.memo, agent_id);
+
+    if content.agent_wallet_rules.len() == original_rule_count && content.memo == original_memo {
+        return Ok(None);
+    }
+
+    let next_version = current_version + 1;
+    let state_hash = generate_state_hash(&content)?;
+    let content_json = serde_json::to_value(&content).map_err(|e| {
+        AppError::Internal(anyhow::anyhow!("Failed to serialize constitution: {}", e))
+    })?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO constitution_history (treasury_id, version, state_hash, content)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(treasury_id)
+    .bind(next_version)
+    .bind(&state_hash)
+    .bind(&content_json)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE treasuries SET constitution_version = $1, updated_at = $2 WHERE treasury_id = $3",
+    )
+    .bind(next_version)
+    .bind(Utc::now())
+    .bind(treasury_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(Some((next_version, content)))
 }
 
 fn session_expiry_datetime() -> DateTime<Utc> {
@@ -311,7 +411,8 @@ async fn check_signer_on_chain(
     let body: serde_json::Value = resp.json().await?;
     if let Some(signers) = body["signers"].as_array() {
         for signer in signers {
-            if signer["key"].as_str() == Some(agent_pubkey) && signer["weight"].as_i64().unwrap_or(0) >= 1
+            if signer["key"].as_str() == Some(agent_pubkey)
+                && signer["weight"].as_i64().unwrap_or(0) >= 1
             {
                 return Ok(true);
             }
@@ -326,18 +427,31 @@ async fn compute_connection_status(
     agent: &AgentSlot,
 ) -> AppResult<(String, Option<String>, Vec<ConstitutionAgentWalletRule>)> {
     if agent.status == "REVOKED" {
-        return Ok(("FAILED".to_string(), Some("AGENT_REVOKED".to_string()), vec![]));
+        return Ok((
+            "FAILED".to_string(),
+            Some("AGENT_REVOKED".to_string()),
+            vec![],
+        ));
     }
 
     if agent.status == "SUSPENDED" {
-        return Ok(("FAILED".to_string(), Some("AGENT_SUSPENDED".to_string()), vec![]));
+        return Ok((
+            "FAILED".to_string(),
+            Some("AGENT_SUSPENDED".to_string()),
+            vec![],
+        ));
     }
 
     let Some(agent_pubkey) = agent.agent_pubkey.clone() else {
-        return Ok(("PENDING".to_string(), Some("PENDING_PUBKEY".to_string()), vec![]));
+        return Ok((
+            "PENDING".to_string(),
+            Some("PENDING_PUBKEY".to_string()),
+            vec![],
+        ));
     };
 
-    let rules = load_constitution_rules_for_agent(&state.db, agent.treasury_id, agent.agent_id).await?;
+    let rules =
+        load_constitution_rules_for_agent(&state.db, agent.treasury_id, agent.agent_id).await?;
     if rules.is_empty() {
         return Ok((
             "PENDING".to_string(),
@@ -356,7 +470,11 @@ async fn compute_connection_status(
         .unwrap_or(false);
 
         if !is_signer {
-            return Ok(("PENDING".to_string(), Some("PENDING_SIGNER".to_string()), rules));
+            return Ok((
+                "PENDING".to_string(),
+                Some("PENDING_SIGNER".to_string()),
+                rules,
+            ));
         }
     }
 
@@ -375,7 +493,11 @@ async fn create_agent_slot(
         ));
     }
 
-    if payload.description.as_ref().is_some_and(|value| value.len() > 255) {
+    if payload
+        .description
+        .as_ref()
+        .is_some_and(|value| value.len() > 255)
+    {
         return Err(AppError::InvalidInput(
             "Description must be 255 characters or fewer".into(),
         ));
@@ -388,12 +510,11 @@ async fn create_agent_slot(
         ));
     }
 
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT agent_id FROM agent_slots WHERE agent_pubkey = $1"
-    )
-    .bind(pubkey)
-    .fetch_optional(&state.db)
-    .await?;
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT agent_id FROM agent_slots WHERE agent_pubkey = $1")
+            .bind(pubkey)
+            .fetch_optional(&state.db)
+            .await?;
 
     if existing.is_some() {
         return Err(AppError::PubkeyConflict);
@@ -439,13 +560,18 @@ async fn create_agent_slot(
         last_connected: None,
     };
 
-    let _ = state.tx_events.send(crate::TreasuryEvent::AgentStatusChanged {
-        treasury_id,
-        agent_id,
-        new_status: "PENDING_CONFIGURATION".to_string(),
-    });
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::AgentStatusChanged {
+            treasury_id,
+            agent_id,
+            new_status: "PENDING_CONFIGURATION".to_string(),
+        });
 
-    Ok((axum::http::StatusCode::CREATED, Json(CreateAgentResponse { agent })))
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(CreateAgentResponse { agent }),
+    ))
 }
 
 async fn issue_agent_session(
@@ -454,11 +580,7 @@ async fn issue_agent_session(
     treasury_id: Uuid,
     agent_pubkey: &str,
 ) -> AppResult<RefreshTicketResponse> {
-    let session_token = format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
+    let session_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let expires_at = session_expiry_datetime();
     let session = AgentSession {
         agent_id,
@@ -679,11 +801,13 @@ pub async fn enroll_pubkey(
     slot.status = new_status.clone();
     enrich_slot_with_status(&mut slot, &connection_phase, reason_code.as_deref());
 
-    let _ = state.tx_events.send(crate::TreasuryEvent::AgentStatusChanged {
-        treasury_id: slot.treasury_id,
-        agent_id,
-        new_status,
-    });
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::AgentStatusChanged {
+            treasury_id: slot.treasury_id,
+            agent_id,
+            new_status,
+        });
 
     Ok(Json(slot))
 }
@@ -810,7 +934,9 @@ pub async fn connect_complete(
         &state.config.stellar.network_passphrase,
     )?;
 
-    let _: redis::RedisResult<()> = redis_conn.del(connect_challenge_key(&payload.agent_pubkey)).await;
+    let _: redis::RedisResult<()> = redis_conn
+        .del(connect_challenge_key(&payload.agent_pubkey))
+        .await;
 
     let row = sqlx::query(
         r#"SELECT agent_id, treasury_id, name, description, wallet_address, agent_pubkey, status,
@@ -823,7 +949,13 @@ pub async fn connect_complete(
     let mut agent = row_to_agent_slot(&row);
     let (connection_phase, reason_code, rules) = compute_connection_status(&state, &agent).await?;
     let wallet_access = build_wallet_access(&state.db, agent.treasury_id, &rules).await?;
-    let ticket = issue_agent_session(&state, agent.agent_id, agent.treasury_id, &payload.agent_pubkey).await?;
+    let ticket = issue_agent_session(
+        &state,
+        agent.agent_id,
+        agent.treasury_id,
+        &payload.agent_pubkey,
+    )
+    .await?;
     let next_status = if connection_phase == "COMPLETE" {
         "ACTIVE".to_string()
     } else {
@@ -844,11 +976,13 @@ pub async fn connect_complete(
         treasury_id: agent.treasury_id,
         agent_id: agent.agent_id,
     });
-    let _ = state.tx_events.send(crate::TreasuryEvent::AgentStatusChanged {
-        treasury_id: agent.treasury_id,
-        agent_id: agent.agent_id,
-        new_status: next_status.clone(),
-    });
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::AgentStatusChanged {
+            treasury_id: agent.treasury_id,
+            agent_id: agent.agent_id,
+            new_status: next_status.clone(),
+        });
     if connection_phase == "COMPLETE" {
         let _ = state.tx_events.send(crate::TreasuryEvent::AgentActivated {
             treasury_id: agent.treasury_id,
@@ -1004,14 +1138,96 @@ pub async fn revoke_agent(
     _auth: AuthUser,
     Path((treasury_id, agent_id)): Path<(Uuid, Uuid)>,
 ) -> AppResult<Json<AgentSlot>> {
-    sqlx::query(
-        "UPDATE agent_slots SET status = 'REVOKED', revoked_at = $1 WHERE agent_id = $2 AND treasury_id = $3",
+    let existing = sqlx::query(
+        "SELECT agent_pubkey FROM agent_slots WHERE agent_id = $1 AND treasury_id = $2",
     )
-    .bind(Utc::now())
     .bind(agent_id)
     .bind(treasury_id)
-    .execute(&state.db)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::AgentNotFound)?;
+
+    let existing_pubkey: Option<String> = existing.get("agent_pubkey");
+    let now = Utc::now();
+    let revoked_by = existing_pubkey
+        .clone()
+        .unwrap_or_else(|| "synod".to_string());
+
+    let mut tx = state.db.begin().await?;
+
+    sqlx::query(
+        "UPDATE permits
+         SET status = 'REVOKED',
+             revoke_reason = 'AGENT_REVOKED',
+             revoked_by = $1
+         WHERE treasury_id = $2 AND agent_id = $3 AND status IN ('PENDING', 'ACTIVE')",
+    )
+    .bind(&revoked_by)
+    .bind(treasury_id)
+    .bind(agent_id)
+    .execute(&mut *tx)
     .await?;
+
+    sqlx::query(
+        "UPDATE permit_groups
+         SET status = 'REVOKED'
+         WHERE treasury_id = $1 AND agent_id = $2 AND status IN ('PENDING', 'ACTIVE')",
+    )
+    .bind(treasury_id)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let constitution_update =
+        remove_agent_rules_from_constitution(&mut tx, treasury_id, agent_id).await?;
+
+    sqlx::query(
+        "UPDATE agent_slots
+         SET status = 'REVOKED',
+             revoked_at = $1,
+             agent_pubkey = NULL,
+             wallet_address = NULL,
+             last_connected = NULL
+         WHERE agent_id = $2 AND treasury_id = $3",
+    )
+    .bind(now)
+    .bind(agent_id)
+    .bind(treasury_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let mut redis_conn = state.redis.clone();
+    let _: redis::RedisResult<()> = redis_conn.del(enrollment_challenge_key(agent_id)).await;
+    if let Some(pubkey) = existing_pubkey.as_deref() {
+        let _: redis::RedisResult<()> = redis_conn.del(connect_challenge_key(pubkey)).await;
+    }
+
+    if let Some((version, content)) = constitution_update {
+        let cache_key = format!("constitution:{}", treasury_id);
+        let _: redis::RedisResult<()> = redis_conn
+            .set(
+                &cache_key,
+                serde_json::to_string(&content).unwrap_or_else(|_| "{}".to_string()),
+            )
+            .await;
+
+        let _ = state
+            .tx_events
+            .send(crate::TreasuryEvent::ConstitutionUpdate {
+                treasury_id,
+                version,
+            });
+    }
+
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::AgentStatusChanged {
+            treasury_id,
+            agent_id,
+            new_status: "REVOKED".to_string(),
+        });
 
     let row = sqlx::query(
         r#"SELECT agent_id, treasury_id, name, description, wallet_address, agent_pubkey, status,

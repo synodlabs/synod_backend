@@ -14,25 +14,33 @@ async fn test_email_password_flow() {
     let password = "super_secret_password";
 
     // 1. Register
-    let reg_res = client.post(&format!("{}/v1/auth/register", base_url))
+    let reg_res = client
+        .post(&format!("{}/v1/auth/register", base_url))
         .json(&json!({ "email": email, "password": password }))
         .send()
         .await
         .unwrap();
     assert_eq!(reg_res.status(), StatusCode::OK);
-    
+
     let reg_body: Value = reg_res.json().await.unwrap();
-    assert!(reg_body.get("token").is_some(), "Registration should return a JWT");
-    
+    assert!(
+        reg_body.get("token").is_some(),
+        "Registration should return a JWT"
+    );
+
     // 2. Login
-    let login_res = client.post(&format!("{}/v1/auth/login", base_url))
+    let login_res = client
+        .post(&format!("{}/v1/auth/login", base_url))
         .json(&json!({ "email": email, "password": password }))
         .send()
         .await
         .unwrap();
     assert_eq!(login_res.status(), StatusCode::OK);
     let login_body: Value = login_res.json().await.unwrap();
-    assert!(login_body.get("token").is_some(), "Login should return a JWT");
+    assert!(
+        login_body.get("token").is_some(),
+        "Login should return a JWT"
+    );
 }
 
 #[serial_test::serial]
@@ -44,7 +52,8 @@ async fn test_rate_limiting_11th_attempt_fails() {
 
     // Rate limit prefix triggers on login, not register
     for i in 1..=11 {
-        let res = client.post(&format!("{}/v1/auth/login", base_url))
+        let res = client
+            .post(&format!("{}/v1/auth/login", base_url))
             .json(&json!({ "email": email, "password": "wrongpassword" }))
             .send()
             .await
@@ -66,7 +75,8 @@ async fn test_passkey_flow() {
     let email = "passkey_user@example.com";
 
     // 1. Register Begin
-    let begin_res = client.post(&format!("{}/v1/auth/passkey/register/begin", base_url))
+    let begin_res = client
+        .post(&format!("{}/v1/auth/passkey/register/begin", base_url))
         .json(&json!({ "email": email }))
         .send()
         .await
@@ -76,7 +86,8 @@ async fn test_passkey_flow() {
     let challenge = begin_body.get("challenge").unwrap().as_str().unwrap();
 
     // 2. Register Complete
-    let complete_res = client.post(&format!("{}/v1/auth/passkey/register/complete", base_url))
+    let complete_res = client
+        .post(&format!("{}/v1/auth/passkey/register/complete", base_url))
         .json(&json!({ "email": email, "challenge": challenge, "credential_id": "mock_cred" }))
         .send()
         .await
@@ -86,7 +97,8 @@ async fn test_passkey_flow() {
     assert!(complete_body.get("token").is_some());
 
     // 3. Login Begin
-    let login_begin_res = client.post(&format!("{}/v1/auth/passkey/login/begin", base_url))
+    let login_begin_res = client
+        .post(&format!("{}/v1/auth/passkey/login/begin", base_url))
         .json(&json!({ "email": email }))
         .send()
         .await
@@ -96,8 +108,11 @@ async fn test_passkey_flow() {
     let login_challenge = login_begin_body.get("challenge").unwrap().as_str().unwrap();
 
     // 4. Login Complete
-    let login_complete_res = client.post(&format!("{}/v1/auth/passkey/login/complete", base_url))
-        .json(&json!({ "email": email, "challenge": login_challenge, "credential_id": "mock_cred" }))
+    let login_complete_res = client
+        .post(&format!("{}/v1/auth/passkey/login/complete", base_url))
+        .json(
+            &json!({ "email": email, "challenge": login_challenge, "credential_id": "mock_cred" }),
+        )
         .send()
         .await
         .unwrap();

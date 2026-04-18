@@ -120,21 +120,37 @@ impl IntoResponse for AppError {
             AppError::TokenInvalid => (StatusCode::UNAUTHORIZED, "TOKEN_INVALID"),
             AppError::ChallengeExpired => (StatusCode::UNAUTHORIZED, "CHALLENGE_EXPIRED"),
             AppError::InvalidAgentSession => (StatusCode::UNAUTHORIZED, "INVALID_AGENT_SESSION"),
-            AppError::RequestSignatureInvalid => (StatusCode::UNAUTHORIZED, "REQUEST_SIGNATURE_INVALID"),
+            AppError::RequestSignatureInvalid => {
+                (StatusCode::UNAUTHORIZED, "REQUEST_SIGNATURE_INVALID")
+            }
             AppError::RequestReplay => (StatusCode::CONFLICT, "REQUEST_REPLAY"),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             AppError::TreasuryNotFound => (StatusCode::NOT_FOUND, "TREASURY_NOT_FOUND"),
             AppError::TreasuryHalted => (StatusCode::FORBIDDEN, "TREASURY_HALTED"),
-            AppError::AllocationSumInvalid => (StatusCode::UNPROCESSABLE_ENTITY, "ALLOCATION_SUM_INVALID"),
-            AppError::PoolBoundsConflict => (StatusCode::UNPROCESSABLE_ENTITY, "POOL_BOUNDS_CONFLICT"),
+            AppError::AllocationSumInvalid => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "ALLOCATION_SUM_INVALID")
+            }
+            AppError::PoolBoundsConflict => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "POOL_BOUNDS_CONFLICT")
+            }
             AppError::AgentNotFound => (StatusCode::NOT_FOUND, "AGENT_NOT_FOUND"),
             AppError::AgentSuspended => (StatusCode::FORBIDDEN, "AGENT_SUSPENDED"),
             AppError::AgentRevoked => (StatusCode::FORBIDDEN, "AGENT_REVOKED"),
             AppError::PubkeyConflict => (StatusCode::CONFLICT, "PUBKEY_CONFLICT"),
-            AppError::SignerAuthDeclined => (StatusCode::FORBIDDEN, "SIGNER_AUTHORIZATION_DECLINED"),
-            AppError::WalletSessionUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "WALLET_SESSION_UNAVAILABLE"),
-            AppError::SignerAuthTimeout => (StatusCode::REQUEST_TIMEOUT, "SIGNER_AUTHORIZATION_TIMEOUT"),
-            AppError::SetOptionsSubmissionFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "SETOPTIONS_SUBMISSION_FAILED"),
+            AppError::SignerAuthDeclined => {
+                (StatusCode::FORBIDDEN, "SIGNER_AUTHORIZATION_DECLINED")
+            }
+            AppError::WalletSessionUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "WALLET_SESSION_UNAVAILABLE",
+            ),
+            AppError::SignerAuthTimeout => {
+                (StatusCode::REQUEST_TIMEOUT, "SIGNER_AUTHORIZATION_TIMEOUT")
+            }
+            AppError::SetOptionsSubmissionFailed(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETOPTIONS_SUBMISSION_FAILED",
+            ),
             AppError::PermitNotFound => (StatusCode::NOT_FOUND, "PERMIT_NOT_FOUND"),
             AppError::PermitExpired => (StatusCode::GONE, "PERMIT_EXPIRED"),
             AppError::CosignFailed(_) => (StatusCode::BAD_REQUEST, "COSIGN_FAILED"),

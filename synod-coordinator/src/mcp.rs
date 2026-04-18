@@ -20,8 +20,8 @@ use crate::{
     auth::{load_agent_session, store_agent_session, AgentSession},
     constitution::{normalize_constitution_value, rules_for_agent},
     error::{AppError, AppResult},
-    permit::process_single_permit, stellar,
-    AppState,
+    permit::process_single_permit,
+    stellar, AppState,
 };
 use synod_shared::models::PermitRequest;
 
@@ -201,7 +201,11 @@ pub async fn connect_init(
         .map_err(|error| AppError::Internal(anyhow::anyhow!("Nonce encode failed: {}", error)))?;
 
     let _: () = redis
-        .set_ex(mcp_connect_nonce_key(&agent.public_key), encoded, MCP_CONNECT_TTL_SECS)
+        .set_ex(
+            mcp_connect_nonce_key(&agent.public_key),
+            encoded,
+            MCP_CONNECT_TTL_SECS,
+        )
         .await
         .map_err(AppError::Redis)?;
 
@@ -226,7 +230,10 @@ pub async fn connect_complete(
     let record: ConnectNonceRecord = serde_json::from_str(&stored)
         .map_err(|error| AppError::Internal(anyhow::anyhow!("Nonce decode failed: {}", error)))?;
 
-    if record.public_key != payload.public_key || record.nonce != payload.nonce || record.expires_at <= Utc::now().timestamp() {
+    if record.public_key != payload.public_key
+        || record.nonce != payload.nonce
+        || record.expires_at <= Utc::now().timestamp()
+    {
         return Err(AppError::ChallengeExpired);
     }
 
@@ -295,7 +302,11 @@ pub async fn submit_intent(
     ensure_connect_allowed(&agent)?;
 
     let canonical_intent = canonical_json_bytes(&payload.intent);
-    stellar::verify_raw_ed25519_signature(&payload.public_key, &canonical_intent, &payload.signature)?;
+    stellar::verify_raw_ed25519_signature(
+        &payload.public_key,
+        &canonical_intent,
+        &payload.signature,
+    )?;
 
     let intent_id = Uuid::new_v4();
     let created_at = Utc::now().timestamp_millis();
@@ -305,7 +316,11 @@ pub async fn submit_intent(
 
     let mut tx = state.db.begin().await?;
     let group_id = Uuid::new_v4();
-    let requested_usd = resolved_intent.amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let requested_usd = resolved_intent
+        .amount
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
 
     sqlx::query(
         r#"INSERT INTO permit_groups (group_id, agent_id, treasury_id, total_requested_usd, total_approved_usd, status, expires_at)
@@ -329,16 +344,28 @@ pub async fn submit_intent(
         requested_amount: resolved_intent.amount.clone(),
     };
 
-    let (result, permit_id) = process_single_permit(&mut tx, &state, &permit_request, group_id, Uuid::new_v4()).await?;
-    let status = if result.approved { "confirmed" } else { "rejected" }.to_string();
-    let approved_total = result.approved_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let (result, permit_id) =
+        process_single_permit(&mut tx, &state, &permit_request, group_id, Uuid::new_v4()).await?;
+    let status = if result.approved {
+        "confirmed"
+    } else {
+        "rejected"
+    }
+    .to_string();
+    let approved_total = result
+        .approved_amount
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(0.0);
 
-    sqlx::query("UPDATE permit_groups SET status = $1, total_approved_usd = $2 WHERE group_id = $3")
-        .bind(if result.approved { "ACTIVE" } else { "DENIED" })
-        .bind(approved_total)
-        .bind(group_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE permit_groups SET status = $1, total_approved_usd = $2 WHERE group_id = $3",
+    )
+    .bind(if result.approved { "ACTIVE" } else { "DENIED" })
+    .bind(approved_total)
+    .bind(group_id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -425,40 +452,49 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState, session: Ag
 
 fn map_event_for_mcp(event: &crate::TreasuryEvent, session: &AgentSession) -> Option<Value> {
     match event {
-        crate::TreasuryEvent::ConstitutionUpdate { treasury_id, version }
-            if *treasury_id == session.treasury_id =>
-        {
-            Some(serde_json::json!({
-                "type": "policy_updated",
-                "version": version,
-            }))
-        }
-        crate::TreasuryEvent::AgentSuspended { treasury_id, agent_id }
-            if *treasury_id == session.treasury_id && *agent_id == session.agent_id =>
-        {
+        crate::TreasuryEvent::ConstitutionUpdate {
+            treasury_id,
+            version,
+        } if *treasury_id == session.treasury_id => Some(serde_json::json!({
+            "type": "policy_updated",
+            "version": version,
+        })),
+        crate::TreasuryEvent::AgentSuspended {
+            treasury_id,
+            agent_id,
+        } if *treasury_id == session.treasury_id && *agent_id == session.agent_id => {
             Some(serde_json::json!({ "type": "agent_suspended" }))
         }
-        crate::TreasuryEvent::IntentConfirmed { treasury_id, agent_id, intent_id, tx_hash }
-            if *treasury_id == session.treasury_id && *agent_id == session.agent_id =>
-        {
+        crate::TreasuryEvent::IntentConfirmed {
+            treasury_id,
+            agent_id,
+            intent_id,
+            tx_hash,
+        } if *treasury_id == session.treasury_id && *agent_id == session.agent_id => {
             Some(serde_json::json!({
                 "type": "intent_confirmed",
                 "intent_id": intent_id,
                 "tx_hash": tx_hash,
             }))
         }
-        crate::TreasuryEvent::IntentRejected { treasury_id, agent_id, intent_id, reason }
-            if *treasury_id == session.treasury_id && *agent_id == session.agent_id =>
-        {
+        crate::TreasuryEvent::IntentRejected {
+            treasury_id,
+            agent_id,
+            intent_id,
+            reason,
+        } if *treasury_id == session.treasury_id && *agent_id == session.agent_id => {
             Some(serde_json::json!({
                 "type": "intent_rejected",
                 "intent_id": intent_id,
                 "reason": reason,
             }))
         }
-        crate::TreasuryEvent::IntentFailed { treasury_id, agent_id, intent_id, reason }
-            if *treasury_id == session.treasury_id && *agent_id == session.agent_id =>
-        {
+        crate::TreasuryEvent::IntentFailed {
+            treasury_id,
+            agent_id,
+            intent_id,
+            reason,
+        } if *treasury_id == session.treasury_id && *agent_id == session.agent_id => {
             Some(serde_json::json!({
                 "type": "intent_failed",
                 "intent_id": intent_id,
@@ -469,7 +505,10 @@ fn map_event_for_mcp(event: &crate::TreasuryEvent, session: &AgentSession) -> Op
     }
 }
 
-async fn load_agent_by_public_key(state: &AppState, public_key: &str) -> AppResult<Option<McpAgentRecord>> {
+async fn load_agent_by_public_key(
+    state: &AppState,
+    public_key: &str,
+) -> AppResult<Option<McpAgentRecord>> {
     let row = sqlx::query(
         r#"SELECT agent_id, treasury_id, name, agent_pubkey, status, created_at, last_connected
            FROM agent_slots
@@ -521,7 +560,10 @@ async fn issue_ws_ticket(state: &AppState, agent: &McpAgentRecord) -> AppResult<
     Ok(ticket)
 }
 
-async fn project_policy_rules(state: &AppState, agent: &McpAgentRecord) -> AppResult<(Vec<Value>, i64)> {
+async fn project_policy_rules(
+    state: &AppState,
+    agent: &McpAgentRecord,
+) -> AppResult<(Vec<Value>, i64)> {
     let row = sqlx::query(
         r#"SELECT version, content, executed_at
            FROM constitution_history
@@ -596,8 +638,9 @@ fn parse_and_resolve_intent(
         .get("amount")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::InvalidInput("Intent amount must be a string".to_string()))?;
-    let amount = BigDecimal::from_str(amount_text)
-        .map_err(|_| AppError::InvalidInput("Intent amount must be a valid decimal string".to_string()))?;
+    let amount = BigDecimal::from_str(amount_text).map_err(|_| {
+        AppError::InvalidInput("Intent amount must be a valid decimal string".to_string())
+    })?;
 
     let destination = intent
         .get("to")
@@ -609,7 +652,9 @@ fn parse_and_resolve_intent(
         "payment" | "delegate" => intent
             .get("asset")
             .and_then(Value::as_str)
-            .ok_or_else(|| AppError::InvalidInput(format!("{} intents require an asset field", kind)))?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!("{} intents require an asset field", kind))
+            })?
             .to_string(),
         "swap" => intent
             .get("from_asset")
@@ -632,7 +677,9 @@ fn parse_and_resolve_intent(
     }
 
     if kind == "swap" && intent.get("to_asset").and_then(Value::as_str).is_none() {
-        return Err(AppError::InvalidInput("swap intents require to_asset".to_string()));
+        return Err(AppError::InvalidInput(
+            "swap intents require to_asset".to_string(),
+        ));
     }
 
     let wallet_address = resolve_wallet_address(intent, rules)?;
@@ -646,7 +693,10 @@ fn parse_and_resolve_intent(
     })
 }
 
-fn resolve_wallet_address(intent: &Value, rules: &[crate::constitution::AgentWalletRule]) -> AppResult<String> {
+fn resolve_wallet_address(
+    intent: &Value,
+    rules: &[crate::constitution::AgentWalletRule],
+) -> AppResult<String> {
     let explicit_wallet = intent
         .get("wallet_address")
         .and_then(Value::as_str)
@@ -654,7 +704,9 @@ fn resolve_wallet_address(intent: &Value, rules: &[crate::constitution::AgentWal
         .filter(|value| !value.is_empty());
 
     if let Some(wallet_address) = explicit_wallet {
-        let allowed = rules.iter().any(|rule| rule.wallet_address == wallet_address);
+        let allowed = rules
+            .iter()
+            .any(|rule| rule.wallet_address == wallet_address);
         if !allowed {
             return Err(AppError::InvalidInput(
                 "The supplied wallet_address is not assigned to this agent".to_string(),
@@ -679,7 +731,11 @@ async fn store_intent_record(state: &AppState, record: &IntentRecord) -> AppResu
     let encoded = serde_json::to_string(record)
         .map_err(|error| AppError::Internal(anyhow::anyhow!("Intent encode failed: {}", error)))?;
     let _: () = redis
-        .set_ex(mcp_intent_key(record.intent_id), encoded, MCP_INTENT_TTL_SECS)
+        .set_ex(
+            mcp_intent_key(record.intent_id),
+            encoded,
+            MCP_INTENT_TTL_SECS,
+        )
         .await
         .map_err(AppError::Redis)?;
     Ok(())
@@ -696,7 +752,9 @@ fn mcp_intent_key(intent_id: Uuid) -> String {
 fn validate_public_key(public_key: &str) -> AppResult<()> {
     let trimmed = public_key.trim();
     if trimmed.len() != 56 || !trimmed.starts_with('G') {
-        return Err(AppError::InvalidInput("Invalid Stellar public key format".to_string()));
+        return Err(AppError::InvalidInput(
+            "Invalid Stellar public key format".to_string(),
+        ));
     }
     Ok(())
 }
@@ -719,9 +777,15 @@ fn canonical_json(value: &Value) -> String {
 
 fn serialize_canonical_value(value: &Value) -> String {
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+        }
         Value::Array(values) => {
-            let items = values.iter().map(serialize_canonical_value).collect::<Vec<_>>().join(",");
+            let items = values
+                .iter()
+                .map(serialize_canonical_value)
+                .collect::<Vec<_>>()
+                .join(",");
             format!("[{}]", items)
         }
         Value::Object(map) => {
@@ -729,7 +793,13 @@ fn serialize_canonical_value(value: &Value) -> String {
             entries.sort_by(|(left, _), (right, _)| left.cmp(right));
             let items = entries
                 .into_iter()
-                .map(|(key, nested)| format!("{}:{}", serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()), serialize_canonical_value(nested)))
+                .map(|(key, nested)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
+                        serialize_canonical_value(nested)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{{{}}}", items)

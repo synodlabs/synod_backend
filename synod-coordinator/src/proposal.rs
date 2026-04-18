@@ -1,15 +1,18 @@
 use axum::extract::{Path, State};
-use axum::{routing::{get, post}, Json, Router};
-use chrono::{DateTime, Utc, Duration};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::{DateTime, Duration, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::constitution::{generate_state_hash, validate_constitution, ConstitutionContent};
 use crate::error::{AppError, AppResult};
 use crate::AppState;
-use crate::constitution::{ConstitutionContent, validate_constitution, generate_state_hash};
 
 // ── Models ──
 
@@ -51,13 +54,20 @@ pub async fn get_treasury_proposals(
     _auth: AuthUser,
     Path(treasury_id): Path<Uuid>,
 ) -> AppResult<Json<Vec<Proposal>>> {
-    let rows: Vec<(Uuid, Uuid, serde_json::Value, String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+    let rows: Vec<(
+        Uuid,
+        Uuid,
+        serde_json::Value,
+        String,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
         r#"
         SELECT proposal_id, proposer_id, proposed_content, status, created_at, expires_at 
         FROM proposals 
         WHERE treasury_id = $1 
         ORDER BY created_at DESC
-        "#
+        "#,
     )
     .bind(treasury_id)
     .fetch_all(&state.db)
@@ -66,7 +76,7 @@ pub async fn get_treasury_proposals(
     let mut proposals = Vec::new();
     for (pid, proposer, content_raw, status, created, expires) in rows {
         let content: ConstitutionContent = serde_json::from_value(content_raw).unwrap();
-        
+
         let sigs: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
             "SELECT signature_id, signer_wallet, created_at FROM proposal_signatures WHERE proposal_id = $1"
         )
@@ -74,12 +84,15 @@ pub async fn get_treasury_proposals(
         .fetch_all(&state.db)
         .await?;
 
-        let signatures = sigs.into_iter().map(|(id, wallet, created_at)| ProposalSignature {
-            signature_id: id,
-            proposal_id: pid,
-            signer_wallet: wallet,
-            created_at,
-        }).collect();
+        let signatures = sigs
+            .into_iter()
+            .map(|(id, wallet, created_at)| ProposalSignature {
+                signature_id: id,
+                proposal_id: pid,
+                signer_wallet: wallet,
+                created_at,
+            })
+            .collect();
 
         proposals.push(Proposal {
             proposal_id: pid,
@@ -117,7 +130,9 @@ pub async fn create_proposal(
     .await?;
 
     if active_count.0 > 0 {
-        return Err(AppError::InvalidInput("An active proposal already exists for this treasury".to_string()));
+        return Err(AppError::InvalidInput(
+            "An active proposal already exists for this treasury".to_string(),
+        ));
     }
 
     // 3. Insert proposal (72h default TTL)
@@ -142,8 +157,13 @@ pub async fn create_proposal(
     info!(treasury = %treasury_id, proposal = %proposal_id, "New constitution proposal created");
 
     // Re-fetch to return complete state
-    let proposals_res = get_treasury_proposals(State(state), auth, Path(treasury_id)).await?.0;
-    let proposal = proposals_res.into_iter().find(|p| p.proposal_id == proposal_id).unwrap();
+    let proposals_res = get_treasury_proposals(State(state), auth, Path(treasury_id))
+        .await?
+        .0;
+    let proposal = proposals_res
+        .into_iter()
+        .find(|p| p.proposal_id == proposal_id)
+        .unwrap();
 
     Ok((StatusCode::CREATED, Json(proposal)))
 }
@@ -156,17 +176,21 @@ pub async fn sign_proposal(
 ) -> AppResult<(StatusCode, Json<Proposal>)> {
     // 1. Fetch proposal
     let proposal_row: Option<(String, DateTime<Utc>, serde_json::Value)> = sqlx::query_as(
-        "SELECT status, expires_at, proposed_content FROM proposals WHERE proposal_id = $1"
+        "SELECT status, expires_at, proposed_content FROM proposals WHERE proposal_id = $1",
     )
     .bind(proposal_id)
     .fetch_optional(&state.db)
     .await?;
 
-    let (status, expires_at, content_json) = proposal_row.ok_or_else(|| AppError::NotFound("Proposal not found".to_string()))?;
+    let (status, expires_at, content_json) =
+        proposal_row.ok_or_else(|| AppError::NotFound("Proposal not found".to_string()))?;
 
     // 2. Check status and expiry
     if status != "PENDING" {
-        return Err(AppError::InvalidInput(format!("Cannot sign proposal in {} state", status)));
+        return Err(AppError::InvalidInput(format!(
+            "Cannot sign proposal in {} state",
+            status
+        )));
     }
     if Utc::now() > expires_at {
         sqlx::query("UPDATE proposals SET status = 'EXPIRED' WHERE proposal_id = $1")
@@ -186,12 +210,14 @@ pub async fn sign_proposal(
     .await?;
 
     if wallet_active.is_none() {
-        return Err(AppError::InvalidInput("Signer is not an active wallet for this treasury".into()));
+        return Err(AppError::InvalidInput(
+            "Signer is not an active wallet for this treasury".into(),
+        ));
     }
 
     // 4. Verify duplicate signature
     let sig_exists: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM proposal_signatures WHERE proposal_id = $1 AND signer_wallet = $2"
+        "SELECT COUNT(*) FROM proposal_signatures WHERE proposal_id = $1 AND signer_wallet = $2",
     )
     .bind(proposal_id)
     .bind(&payload.wallet_address)
@@ -199,14 +225,16 @@ pub async fn sign_proposal(
     .await?;
 
     if sig_exists.0 > 0 {
-        return Err(AppError::InvalidInput("Wallet has already signed this proposal".into()));
+        return Err(AppError::InvalidInput(
+            "Wallet has already signed this proposal".into(),
+        ));
     }
 
     // 5. Cryptographic Verification
     let content: ConstitutionContent = serde_json::from_value(content_json.clone()).unwrap();
     let proposal_hash = generate_state_hash(&content)?;
     let msg_bytes = format!("SYNOD_PROPOSAL:{}", proposal_hash).into_bytes();
-    
+
     // Use the verify_stellar_signature function from Phase 3
     crate::stellar::verify_stellar_signature(
         &payload.wallet_address,
@@ -229,15 +257,14 @@ pub async fn sign_proposal(
     info!(proposal = %proposal_id, signer = %payload.wallet_address, "Proposal signed");
 
     // 7. Check if Threshold Met
-    let sig_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM proposal_signatures WHERE proposal_id = $1"
-    )
-    .bind(proposal_id)
-    .fetch_one(&state.db)
-    .await?;
+    let sig_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM proposal_signatures WHERE proposal_id = $1")
+            .bind(proposal_id)
+            .fetch_one(&state.db)
+            .await?;
 
     let wallet_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM treasury_wallets WHERE treasury_id = $1 AND status = 'ACTIVE'"
+        "SELECT COUNT(*) FROM treasury_wallets WHERE treasury_id = $1 AND status = 'ACTIVE'",
     )
     .bind(treasury_id)
     .fetch_one(&state.db)
@@ -257,10 +284,12 @@ pub async fn sign_proposal(
             .await?;
 
         // Determine next version
-        let max_v: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM constitution_history WHERE treasury_id = $1")
-            .bind(treasury_id)
-            .fetch_one(&state.db)
-            .await?;
+        let max_v: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) FROM constitution_history WHERE treasury_id = $1",
+        )
+        .bind(treasury_id)
+        .fetch_one(&state.db)
+        .await?;
         let next_version = max_v + 1;
 
         // Apply to history
@@ -286,23 +315,39 @@ pub async fn sign_proposal(
         use redis::AsyncCommands;
         let mut redis = state.redis.clone();
         let cache_key = format!("constitution:{}", treasury_id);
-        let _: () = redis.set(&cache_key, serde_json::to_string(&content).unwrap()).await.unwrap_or(());
+        let _: () = redis
+            .set(&cache_key, serde_json::to_string(&content).unwrap())
+            .await
+            .unwrap_or(());
 
-        let _ = state.tx_events.send(crate::TreasuryEvent::ConstitutionUpdate {
-            treasury_id,
-            version: next_version,
-        });
+        let _ = state
+            .tx_events
+            .send(crate::TreasuryEvent::ConstitutionUpdate {
+                treasury_id,
+                version: next_version,
+            });
     }
 
     // Re-fetch to return updated proposal
-    let proposals_res = get_treasury_proposals(State(state), auth, Path(treasury_id)).await?.0;
-    let updated_proposal = proposals_res.into_iter().find(|p| p.proposal_id == proposal_id).unwrap();
+    let proposals_res = get_treasury_proposals(State(state), auth, Path(treasury_id))
+        .await?
+        .0;
+    let updated_proposal = proposals_res
+        .into_iter()
+        .find(|p| p.proposal_id == proposal_id)
+        .unwrap();
 
     Ok((StatusCode::OK, Json(updated_proposal)))
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/:treasury_id/proposals", get(get_treasury_proposals).post(create_proposal))
-        .route("/:treasury_id/proposals/:proposal_id/sign", post(sign_proposal))
+        .route(
+            "/:treasury_id/proposals",
+            get(get_treasury_proposals).post(create_proposal),
+        )
+        .route(
+            "/:treasury_id/proposals/:proposal_id/sign",
+            post(sign_proposal),
+        )
 }

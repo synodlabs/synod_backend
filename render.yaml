@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: synod-coordinator
+    runtime: rust
+    plan: starter
+    buildCommand: cargo build --release -p synod-coordinator
+    startCommand: ./target/release/synod-coordinator
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: synod-coordinator-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: synod-coordinator-redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: RUST_LOG
+        value: info
+      - key: STELLAR_NETWORK
+        value: testnet
+      - key: HORIZON_URL
+        value: https://horizon-testnet.stellar.org
+      - key: SYNOD_STELLAR__NETWORK_PASSPHRASE
+        value: Test SDF Network ; September 2015
+      - key: SYNOD_STELLAR__COORDINATOR_PUBKEY
+        sync: false
+      - key: SYNOD_STELLAR__COORDINATOR_SECRET_KEY
+        sync: false
+
+  - type: keyvalue
+    name: synod-coordinator-redis
+    plan: starter
+    ipAllowList: []
+
+databases:
+  - name: synod-coordinator-db
+    plan: basic-256mb

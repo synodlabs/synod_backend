@@ -1,12 +1,12 @@
-use sqlx::postgres::PgPoolOptions;
-use uuid::Uuid;
 use chrono::Utc;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    
+
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -20,12 +20,12 @@ async fn main() -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO users (user_id, email, password_hash, name, role) 
          VALUES ($1, 'demo@synod.com', 'dummy', 'Demo User', 'ADMIN')
-         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email RETURNING user_id"
+         ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email RETURNING user_id",
     )
     .bind(user_id)
     .fetch_one(&pool)
     .await?;
-    
+
     let user_row = sqlx::query("SELECT user_id FROM users WHERE email = 'demo@synod.com'")
         .fetch_one(&pool)
         .await?;
@@ -49,10 +49,10 @@ async fn main() -> anyhow::Result<()> {
         "max_drawdown_pct": 15.0,
         "governance_mode": "AUTO"
     });
-    
+
     sqlx::query(
         "INSERT INTO constitution_history (treasury_id, version, state_hash, content, executed_at)
-         VALUES ($1, 0, 'genesis', $2, $3)"
+         VALUES ($1, 0, 'genesis', $2, $3)",
     )
     .bind(treasury_id)
     .bind(content)
@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let wallet_address = "GAX3B7F6J6W6E7M4Y...DEMO"; // Mock
     sqlx::query(
         "INSERT INTO treasury_wallets (treasury_id, wallet_address, label, multisig_active, status)
-         VALUES ($1, $2, 'HOT_WALLET_01', true, 'ACTIVE')"
+         VALUES ($1, $2, 'HOT_WALLET_01', true, 'ACTIVE')",
     )
     .bind(treasury_id)
     .bind(wallet_address)

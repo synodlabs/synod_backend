@@ -1,8 +1,8 @@
-pub use stellar_xdr::curr as next_xdr;
 use crate::error::{AppError, AppResult};
-use ed25519_dalek::{Signer, Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::convert::TryInto;
+pub use stellar_xdr::curr as next_xdr;
 
 pub fn verify_stellar_signature(
     public_key_str: &str,
@@ -11,11 +11,16 @@ pub fn verify_stellar_signature(
     _network_passphrase: &str,
 ) -> AppResult<()> {
     let public_key_bytes = decode_stellar_address(public_key_str)?;
-    let signature_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
-        .map_err(|_| AppError::CosignFailed("Invalid base64 signature".to_string()))?;
+    let signature_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
+            .map_err(|_| AppError::CosignFailed("Invalid base64 signature".to_string()))?;
 
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes.try_into().map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid public key length")))?)
-        .map_err(|_| AppError::CosignFailed("Invalid public key".to_string()))?;
+    let verifying_key = VerifyingKey::from_bytes(
+        &public_key_bytes
+            .try_into()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid public key length")))?,
+    )
+    .map_err(|_| AppError::CosignFailed("Invalid public key".to_string()))?;
 
     let signature = Signature::from_slice(&signature_bytes)
         .map_err(|_| AppError::CosignFailed("Invalid signature format".to_string()))?;
@@ -27,7 +32,8 @@ pub fn verify_stellar_signature(
     hasher.update(message);
     let hashed_payload = hasher.finalize();
 
-    verifying_key.verify(&hashed_payload, &signature)
+    verifying_key
+        .verify(&hashed_payload, &signature)
         .map_err(|_| AppError::OwnershipVerificationFailed)
 }
 
@@ -43,8 +49,9 @@ pub fn verify_raw_ed25519_signature(
     signature_base64: &str,
 ) -> AppResult<()> {
     let public_key_bytes = decode_stellar_address(public_key_str)?;
-    let signature_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
-        .map_err(|_| AppError::RequestSignatureInvalid)?;
+    let signature_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_base64)
+            .map_err(|_| AppError::RequestSignatureInvalid)?;
 
     let verifying_key = VerifyingKey::from_bytes(
         &public_key_bytes
@@ -53,8 +60,8 @@ pub fn verify_raw_ed25519_signature(
     )
     .map_err(|_| AppError::RequestSignatureInvalid)?;
 
-    let signature = Signature::from_slice(&signature_bytes)
-        .map_err(|_| AppError::RequestSignatureInvalid)?;
+    let signature =
+        Signature::from_slice(&signature_bytes).map_err(|_| AppError::RequestSignatureInvalid)?;
 
     verifying_key
         .verify(message, &signature)
@@ -62,17 +69,19 @@ pub fn verify_raw_ed25519_signature(
 }
 
 pub fn decode_stellar_address(address: &str) -> AppResult<[u8; 32]> {
-    let decoded = data_encoding::BASE32_NOPAD.decode(address.as_bytes())
+    let decoded = data_encoding::BASE32_NOPAD
+        .decode(address.as_bytes())
         .map_err(|_| AppError::CosignFailed("Invalid base32 address".into()))?;
-    
+
     if decoded.len() != 35 {
         return Err(AppError::CosignFailed("Invalid address length".into()));
     }
-    
-    if decoded[0] != 0x30 { // G is 0x30
+
+    if decoded[0] != 0x30 {
+        // G is 0x30
         return Err(AppError::CosignFailed("Not a G address".into()));
     }
-    
+
     let mut key = [0u8; 32];
     key.copy_from_slice(&decoded[1..33]);
     Ok(key)
@@ -83,10 +92,7 @@ pub fn construct_set_options_xdr(
     signer_key: &str,
     weight: u32,
 ) -> AppResult<String> {
-    use next_xdr::{
-        Operation, OperationBody, SetOptionsOp, 
-        WriteXdr, Uint256, Signer, SignerKey
-    };
+    use next_xdr::{Operation, OperationBody, SetOptionsOp, Signer, SignerKey, Uint256, WriteXdr};
 
     let _source_bytes = decode_stellar_address(source_account)?;
     let signer_bytes = decode_stellar_address(signer_key)?;
@@ -110,13 +116,72 @@ pub fn construct_set_options_xdr(
     };
 
     // Note: For a real transaction envelope we need Sequence Number, Fee, Network Passphrase, etc.
-    // For Phase 3 multisig coordination, we primarily need the XDR of the SetOptions operation 
+    // For Phase 3 multisig coordination, we primarily need the XDR of the SetOptions operation
     // to pass to the wallet for signing.
-    
-    let xdr = op.to_xdr(next_xdr::Limits::none())
+
+    let xdr = op
+        .to_xdr(next_xdr::Limits::none())
         .map_err(|e| AppError::Internal(anyhow::anyhow!("XDR encoding error: {}", e)))?;
 
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, xdr))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        xdr,
+    ))
+}
+
+pub fn calculate_tx_v1_hashes(
+    raw_envelope: &[u8],
+    network_passphrase: &str,
+) -> AppResult<Vec<[u8; 32]>> {
+    use next_xdr::{ReadXdr, WriteXdr};
+    let mut candidates = Vec::new();
+
+    // 1. Basic validation
+    if raw_envelope.len() < 4 || &raw_envelope[0..4] != &[0, 0, 0, 2] {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "Not a V1 Transaction Envelope"
+        )));
+    }
+
+    // 2. Decode for struct-based hashing
+    let envelope = next_xdr::TransactionEnvelope::from_xdr(raw_envelope, next_xdr::Limits::none())
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("Envelope decoding error: {}", e)))?;
+
+    let next_xdr::TransactionEnvelope::Tx(v1) = &envelope else {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "Unsupported envelope variant"
+        )));
+    };
+
+    // 3. Network ID
+    let clean_passphrase = network_passphrase.trim_matches('"');
+    let mut hasher = Sha256::new();
+    hasher.update(clean_passphrase.as_bytes());
+    let network_id = hasher.finalize();
+
+    // Strategy 1: Re-encoded Struct Hashing
+    let tx_encoded = v1
+        .tx
+        .to_xdr(next_xdr::Limits::none())
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("TX encoding error: {}", e)))?;
+
+    let mut h1 = Sha256::new();
+    h1.update(&network_id);
+    h1.update(&[0, 0, 0, 2]);
+    h1.update(&tx_encoded);
+    candidates.push(h1.finalize().into());
+
+    // Strategy 2: Raw Sliced Hashing
+    let tx_len = tx_encoded.len();
+    if raw_envelope.len() >= 4 + tx_len {
+        let mut h2 = Sha256::new();
+        h2.update(&network_id);
+        h2.update(&[0, 0, 0, 2]);
+        h2.update(&raw_envelope[4..4 + tx_len]);
+        candidates.push(h2.finalize().into());
+    }
+
+    Ok(candidates)
 }
 pub fn sign_transaction_hash(
     secret_key_str: &str,
@@ -127,18 +192,21 @@ pub fn sign_transaction_hash(
 
     // 1. Prepare Network ID
     let mut hasher = Sha256::new();
-    hasher.update(network_passphrase.as_bytes());
+    hasher.update(network_passphrase.trim_matches('"').as_bytes());
     let network_id = hasher.finalize();
 
     // 2. Decode Transaction XDR
-    let raw_tx = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, transaction_xdr_base64)
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid XDR base64")))?;
-    
+    let raw_tx = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        transaction_xdr_base64,
+    )
+    .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid XDR base64")))?;
+
     // We expect just the Transaction struct (not the envelope) for hashing,
     // although some SDKs provide the envelope. If it's the envelope, we'd extract the tx.
-    // In our case, construct_set_options_xdr returns the OP or TX? 
+    // In our case, construct_set_options_xdr returns the OP or TX?
     // Wait, let's assume we receive the Transaction struct.
-    
+
     // 3. Prepare Signing Payload
     let mut payload = Vec::new();
     payload.extend_from_slice(&network_id);
@@ -150,22 +218,28 @@ pub fn sign_transaction_hash(
     let hash = hasher.finalize();
 
     // 4. Sign
-    let secret_bytes = decode_secret_key(secret_key_str)?; 
+    let secret_bytes = decode_secret_key(secret_key_str)?;
     let signing_key = SigningKey::from_bytes(&secret_bytes);
     let signature = <SigningKey as Signer<Signature>>::sign(&signing_key, &hash);
 
-    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.to_bytes()))
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        signature.to_bytes(),
+    ))
 }
 
 pub fn decode_secret_key(secret: &str) -> AppResult<[u8; 32]> {
     // Stellar secrets are BASE32 with 0x40 (S) prefix
-    let decoded = data_encoding::BASE32_NOPAD.decode(secret.as_bytes())
+    let decoded = data_encoding::BASE32_NOPAD
+        .decode(secret.as_bytes())
         .map_err(|_| AppError::Internal(anyhow::anyhow!("Invalid secret key encoding")))?;
-    
+
     if decoded.len() != 35 {
-        return Err(AppError::Internal(anyhow::anyhow!("Invalid secret key length")));
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "Invalid secret key length"
+        )));
     }
-    
+
     let mut key = [0u8; 32];
     key.copy_from_slice(&decoded[1..33]);
     Ok(key)

@@ -1,15 +1,15 @@
-use synod_coordinator::config::Settings;
-use synod_coordinator::{config, AppState, WatcherHandles};
+use dotenvy::dotenv;
 use redis::aio::ConnectionManager;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use synod_coordinator::config::Settings;
+use synod_coordinator::{config, AppState, WatcherHandles};
 use tokio::sync::Mutex;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
-use dotenvy::dotenv;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,8 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .json()
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     info!("Starting Synod Coordinator...");
 
@@ -31,8 +30,9 @@ async fn main() -> anyhow::Result<()> {
         Settings {
             server: config::ServerConfig::default(),
             database: config::DatabaseConfig {
-                url: std::env::var("DATABASE_URL")
-                    .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/synod_db".to_string()),
+                url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                    "postgres://postgres:postgres@localhost:5432/synod_db".to_string()
+                }),
                 max_connections: 20,
             },
             redis: config::RedisConfig {
@@ -43,9 +43,12 @@ async fn main() -> anyhow::Result<()> {
                 network: std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string()),
                 network_passphrase: std::env::var("SYNOD_STELLAR__NETWORK_PASSPHRASE")
                     .unwrap_or_else(|_| "Test SDF Network ; September 2015".to_string()),
-                horizon_url: std::env::var("HORIZON_URL").unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
-                coordinator_pubkey: std::env::var("SYNOD_STELLAR__COORDINATOR_PUBKEY").unwrap_or_default(),
-                coordinator_secret_key: std::env::var("SYNOD_STELLAR__COORDINATOR_SECRET_KEY").unwrap_or_default(),
+                horizon_url: std::env::var("HORIZON_URL")
+                    .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+                coordinator_pubkey: std::env::var("SYNOD_STELLAR__COORDINATOR_PUBKEY")
+                    .unwrap_or_default(),
+                coordinator_secret_key: std::env::var("SYNOD_STELLAR__COORDINATOR_SECRET_KEY")
+                    .unwrap_or_default(),
                 coordinator_secret_key_path: String::new(),
             },
             auth: config::AuthConfig {
@@ -69,9 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Auto-run migrations
     info!("Running database migrations...");
-    sqlx::migrate!("./migrations")
-        .run(&db_pool)
-        .await?;
+    sqlx::migrate!("./migrations").run(&db_pool).await?;
 
     // Connect to Redis
     info!("Connecting to Redis at {}...", settings.redis.url);

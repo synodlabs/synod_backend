@@ -1,12 +1,12 @@
+use crate::auth::AuthUser;
+use crate::error::{AppError, AppResult};
+use crate::AppState;
 use axum::extract::{Path, State};
 use axum::{routing::post, Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use crate::error::{AppError, AppResult};
-use crate::AppState;
-use crate::auth::AuthUser;
 use sqlx::Row;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTreasuryRequest {
@@ -33,7 +33,7 @@ pub async fn create_treasury(
     Json(payload): Json<CreateTreasuryRequest>,
 ) -> AppResult<Json<TreasuryResponse>> {
     let treasury_id = Uuid::new_v4();
-    
+
     let mut tx = state.db.begin().await?;
 
     sqlx::query(
@@ -60,7 +60,7 @@ pub async fn create_treasury(
 
     sqlx::query(
         "INSERT INTO constitution_history (version, treasury_id, state_hash, content, executed_at)
-         VALUES (0, $1, 'genesis', $2, $3)"
+         VALUES (0, $1, 'genesis', $2, $3)",
     )
     .bind(treasury_id)
     .bind(initial_content)
@@ -85,15 +85,16 @@ pub async fn register_wallet(
     Path(treasury_id): Path<Uuid>,
     Json(payload): Json<RegisterWalletRequest>,
 ) -> AppResult<StatusCode> {
-
     // Verify treasury ownership
-    let is_owner: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)")
-        .bind(treasury_id)
-        .bind(auth.user_id)
-        .fetch_one(&state.db)
-        .await
-        .map(|row| row.get(0))
-        .unwrap_or(false);
+    let is_owner: bool = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)",
+    )
+    .bind(treasury_id)
+    .bind(auth.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map(|row| row.get(0))
+    .unwrap_or(false);
 
     if !is_owner {
         return Err(AppError::TreasuryNotFound);
@@ -123,12 +124,16 @@ pub async fn apply_halt(
     let lock_key = (treasury_id.as_u128() & 0xFFFFFFFF) as i64;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
-        .execute(&mut **tx).await?;
+        .execute(&mut **tx)
+        .await?;
 
     // 2. Set Treasury Health
-    sqlx::query("UPDATE treasuries SET health = 'HALTED', updated_at = NOW() WHERE treasury_id = $1")
-        .bind(treasury_id)
-        .execute(&mut **tx).await?;
+    sqlx::query(
+        "UPDATE treasuries SET health = 'HALTED', updated_at = NOW() WHERE treasury_id = $1",
+    )
+    .bind(treasury_id)
+    .execute(&mut **tx)
+    .await?;
 
     // 3. Lock Pools in current constitution
     // In a real system, we'd create a new constitution version with locked: true for all pools.
@@ -136,9 +141,12 @@ pub async fn apply_halt(
     // The policy engine already checks check_treasury_halted(treasury_state).
 
     // 4. Revoke All Active Permits
-    sqlx::query("UPDATE permits SET status = 'REVOKED' WHERE treasury_id = $1 AND status = 'ACTIVE'")
-        .bind(treasury_id)
-        .execute(&mut **tx).await?;
+    sqlx::query(
+        "UPDATE permits SET status = 'REVOKED' WHERE treasury_id = $1 AND status = 'ACTIVE'",
+    )
+    .bind(treasury_id)
+    .execute(&mut **tx)
+    .await?;
 
     Ok(())
 }
@@ -149,12 +157,14 @@ pub async fn resume_treasury(
     Path(treasury_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     // 1. Verify Ownership
-    let is_owner: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)")
-        .bind(treasury_id)
-        .bind(auth.user_id)
-        .fetch_one(&state.db)
-        .await?
-        .get(0);
+    let is_owner: bool = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)",
+    )
+    .bind(treasury_id)
+    .bind(auth.user_id)
+    .fetch_one(&state.db)
+    .await?
+    .get(0);
 
     if !is_owner {
         return Err(AppError::TreasuryNotFound);
@@ -170,7 +180,9 @@ pub async fn resume_treasury(
     .execute(&mut *tx).await?;
 
     tx.commit().await?;
-    let _ = state.tx_events.send(crate::TreasuryEvent::TreasuryResumed { treasury_id });
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::TreasuryResumed { treasury_id });
 
     Ok(StatusCode::OK)
 }
@@ -181,12 +193,14 @@ pub async fn remove_wallet(
     Path((treasury_id, wallet_address)): Path<(Uuid, String)>,
 ) -> AppResult<StatusCode> {
     // 1. Verify Ownership
-    let is_owner: bool = sqlx::query("SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)")
-        .bind(treasury_id)
-        .bind(auth.user_id)
-        .fetch_one(&state.db)
-        .await?
-        .get(0);
+    let is_owner: bool = sqlx::query(
+        "SELECT EXISTS(SELECT 1 FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2)",
+    )
+    .bind(treasury_id)
+    .bind(auth.user_id)
+    .fetch_one(&state.db)
+    .await?
+    .get(0);
 
     if !is_owner {
         return Err(AppError::TreasuryNotFound);

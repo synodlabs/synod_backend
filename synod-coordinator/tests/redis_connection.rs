@@ -4,8 +4,8 @@ use redis::AsyncCommands;
 #[tokio::test]
 async fn redis_connection_works() {
     dotenvy::dotenv().ok();
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
     let client = redis::Client::open(redis_url).expect("Failed to create Redis client");
     let mut conn = redis::aio::ConnectionManager::new(client)
@@ -13,18 +13,21 @@ async fn redis_connection_works() {
         .expect("Failed to connect to Redis");
 
     // SET and GET a test key
-    let _: () = conn.set("synod:test:ping", "pong")
+    let _: () = conn
+        .set("synod:test:ping", "pong")
         .await
         .expect("Failed to SET test key");
 
-    let val: String = conn.get("synod:test:ping")
+    let val: String = conn
+        .get("synod:test:ping")
         .await
         .expect("Failed to GET test key");
 
     assert_eq!(val, "pong");
 
     // Clean up
-    let _: () = conn.del("synod:test:ping")
+    let _: () = conn
+        .del("synod:test:ping")
         .await
         .expect("Failed to DEL test key");
 }
@@ -33,8 +36,8 @@ async fn redis_connection_works() {
 #[tokio::test]
 async fn redis_connection_manager_pooling() {
     dotenvy::dotenv().ok();
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
     let client = redis::Client::open(redis_url).expect("Failed to create Redis client");
     let manager = redis::aio::ConnectionManager::new(client)

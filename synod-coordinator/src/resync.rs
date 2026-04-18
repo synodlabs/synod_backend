@@ -1,12 +1,12 @@
+use crate::auth::AuthUser;
+use crate::error::{AppError, AppResult};
+use crate::AppState;
 use axum::extract::{Path, State};
 use axum::{routing::post, Json, Router};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 use uuid::Uuid;
-use tracing::{info, warn, error};
-use crate::error::{AppError, AppResult};
-use crate::AppState;
-use crate::auth::AuthUser;
 
 // ── Price Fetching ──
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -65,7 +65,8 @@ async fn fetch_from_stellar_dex(asset_code: &str, state: &AppState) -> Option<f6
 
                                 let mut redis = state.redis.clone();
                                 let key = format!("price:last:{}", asset_code);
-                                let _: redis::RedisResult<()> = redis.set_ex(&key, final_price.to_string(), 3600).await;
+                                let _: redis::RedisResult<()> =
+                                    redis.set_ex(&key, final_price.to_string(), 3600).await;
 
                                 return Some(final_price);
                             }
@@ -127,14 +128,11 @@ pub struct WalletBalance {
     pub usd_value: f64,
 }
 
-pub async fn resync_treasury(
-    treasury_id: Uuid,
-    state: &AppState,
-) -> AppResult<ResyncResult> {
+pub async fn resync_treasury(treasury_id: Uuid, state: &AppState) -> AppResult<ResyncResult> {
     info!(treasury = %treasury_id, "Starting balance resync");
 
     let wallets: Vec<(String,)> = sqlx::query_as(
-        "SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 AND status = 'ACTIVE'"
+        "SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 AND status = 'ACTIVE'",
     )
     .bind(treasury_id)
     .fetch_all(&state.db)
@@ -145,7 +143,10 @@ pub async fn resync_treasury(
     let mut total_aum = 0.0;
 
     for (wallet_address,) in &wallets {
-        let url = format!("{}/accounts/{}", state.config.stellar.horizon_url, wallet_address);
+        let url = format!(
+            "{}/accounts/{}",
+            state.config.stellar.horizon_url, wallet_address
+        );
 
         match client.get(&url).send().await {
             Ok(resp) => {
@@ -189,10 +190,12 @@ pub async fn resync_treasury(
             .map_err(|e| AppError::Internal(anyhow::anyhow!("JSON error: {}", e)))?;
         let _: redis::RedisResult<()> = redis.set(&snapshot_key, &snapshot_json).await;
 
-        let _: redis::RedisResult<()> = redis.set(
-            format!("treasury:aum:{}", treasury_id),
-            total_aum.to_string(),
-        ).await;
+        let _: redis::RedisResult<()> = redis
+            .set(
+                format!("treasury:aum:{}", treasury_id),
+                total_aum.to_string(),
+            )
+            .await;
     }
 
     // Update peak AUM if current exceeds it
@@ -227,16 +230,17 @@ pub async fn manual_resync(
 pub async fn scheduled_reconciliation(state: AppState) {
     info!("Starting scheduled 6-hour reconciliation");
 
-    let treasuries: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT treasury_id FROM treasuries WHERE health != 'HALTED'"
-    )
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    let treasuries: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT treasury_id FROM treasuries WHERE health != 'HALTED'")
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
 
     for (tid,) in treasuries {
         match resync_treasury(tid, &state).await {
-            Ok(result) => info!(treasury = %tid, aum = result.total_aum_usd, "Reconciliation complete"),
+            Ok(result) => {
+                info!(treasury = %tid, aum = result.total_aum_usd, "Reconciliation complete")
+            }
             Err(e) => error!(treasury = %tid, error = %e, "Reconciliation failed"),
         }
     }
@@ -244,6 +248,5 @@ pub async fn scheduled_reconciliation(state: AppState) {
 
 /// Admin-only router (legacy path — kept for backward compat)
 pub fn admin_router() -> Router<AppState> {
-    Router::new()
-        .route("/treasuries/:id/resync", post(manual_resync))
+    Router::new().route("/treasuries/:id/resync", post(manual_resync))
 }

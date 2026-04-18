@@ -1,8 +1,8 @@
 use bigdecimal::BigDecimal;
 use reqwest::StatusCode;
+use serde::Serialize;
 use synod_shared::models::PermitRequest;
 use uuid::Uuid;
-use serde::Serialize;
 
 mod common;
 use common::{
@@ -39,12 +39,23 @@ async fn setup_active_agent() -> (
         .unwrap();
 
     let agent_id = create_agent_slot(&ctx, treasury_id, "Permit Agent", &agent_pubkey).await;
-    enroll_agent_pubkey(&ctx, agent_id, &wallet_address, &wallet_signing_key, &agent_pubkey).await;
+    enroll_agent_pubkey(
+        &ctx,
+        agent_id,
+        &wallet_address,
+        &wallet_signing_key,
+        &agent_pubkey,
+    )
+    .await;
     let connect_data = connect_agent(&ctx, &agent_pubkey, &agent_signing_key).await;
     let session_token = connect_data["session_token"].as_str().unwrap().to_string();
 
-    let constitution_response = ctx.client
-        .post(format!("{}/v1/treasuries/{}/constitution", ctx.base_url, treasury_id))
+    let constitution_response = ctx
+        .client
+        .post(format!(
+            "{}/v1/treasuries/{}/constitution",
+            ctx.base_url, treasury_id
+        ))
         .header("Authorization", format!("Bearer {}", ctx.user_token))
         .json(&serde_json::json!({
             "content": {
@@ -87,8 +98,15 @@ async fn setup_active_agent() -> (
 #[serial_test::serial]
 #[tokio::test]
 async fn test_permit_full_lifecycle_with_signed_requests() {
-    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
-        setup_active_agent().await;
+    let (
+        ctx,
+        treasury_id,
+        agent_id,
+        wallet_address,
+        agent_signing_key,
+        agent_pubkey,
+        session_token,
+    ) = setup_active_agent().await;
 
     let permit = PermitRequest {
         agent_id,
@@ -159,19 +177,27 @@ async fn test_permit_full_lifecycle_with_signed_requests() {
         .unwrap();
     assert_eq!(outcome_response.status(), StatusCode::OK);
 
-    let permit_status: String = sqlx::query_scalar("SELECT status FROM permits WHERE permit_id = $1")
-        .bind(permit_id)
-        .fetch_one(&ctx.db)
-        .await
-        .unwrap();
+    let permit_status: String =
+        sqlx::query_scalar("SELECT status FROM permits WHERE permit_id = $1")
+            .bind(permit_id)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
     assert_eq!(permit_status, "CONSUMED");
 }
 
 #[serial_test::serial]
 #[tokio::test]
 async fn test_signed_request_replay_is_rejected() {
-    let (ctx, treasury_id, agent_id, wallet_address, agent_signing_key, agent_pubkey, session_token) =
-        setup_active_agent().await;
+    let (
+        ctx,
+        treasury_id,
+        agent_id,
+        wallet_address,
+        agent_signing_key,
+        agent_pubkey,
+        session_token,
+    ) = setup_active_agent().await;
 
     let permit = PermitRequest {
         agent_id,
@@ -181,7 +207,13 @@ async fn test_signed_request_replay_is_rejected() {
         asset_issuer: None,
         requested_amount: BigDecimal::from(100),
     };
-    let request_auth = build_signed_request_auth(&agent_signing_key, &agent_pubkey, agent_id, "permit.request", &permit);
+    let request_auth = build_signed_request_auth(
+        &agent_signing_key,
+        &agent_pubkey,
+        agent_id,
+        "permit.request",
+        &permit,
+    );
     let body = serde_json::json!({
         "agent_id": permit.agent_id,
         "treasury_id": permit.treasury_id,
@@ -192,7 +224,8 @@ async fn test_signed_request_replay_is_rejected() {
         "request_auth": request_auth,
     });
 
-    let first = ctx.client
+    let first = ctx
+        .client
         .post(format!("{}/v1/permits/request", ctx.base_url))
         .header("Authorization", format!("Bearer {}", session_token))
         .json(&body)
@@ -201,7 +234,8 @@ async fn test_signed_request_replay_is_rejected() {
         .unwrap();
     assert_eq!(first.status(), StatusCode::CREATED);
 
-    let second = ctx.client
+    let second = ctx
+        .client
         .post(format!("{}/v1/permits/request", ctx.base_url))
         .header("Authorization", format!("Bearer {}", session_token))
         .json(&body)
