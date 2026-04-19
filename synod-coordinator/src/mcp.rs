@@ -253,9 +253,12 @@ pub async fn connect_complete(
     ensure_connect_allowed(&agent)?;
 
     let ws_ticket = issue_ws_ticket(&state, &agent).await?;
+    let next_status = resolve_mcp_slot_status(&state, &agent).await?;
+    let now = Utc::now();
 
-    sqlx::query("UPDATE agent_slots SET last_connected = $1 WHERE agent_id = $2")
-        .bind(Utc::now())
+    sqlx::query("UPDATE agent_slots SET status = $1, last_connected = $2 WHERE agent_id = $3")
+        .bind(&next_status)
+        .bind(now)
         .bind(agent.agent_id)
         .execute(&state.db)
         .await?;
@@ -264,6 +267,19 @@ pub async fn connect_complete(
         treasury_id: agent.treasury_id,
         agent_id: agent.agent_id,
     });
+    let _ = state
+        .tx_events
+        .send(crate::TreasuryEvent::AgentStatusChanged {
+            treasury_id: agent.treasury_id,
+            agent_id: agent.agent_id,
+            new_status: next_status.clone(),
+        });
+    if next_status == "ACTIVE" {
+        let _ = state.tx_events.send(crate::TreasuryEvent::AgentActivated {
+            treasury_id: agent.treasury_id,
+            agent_id: agent.agent_id,
+        });
+    }
 
     Ok(Json(ConnectCompleteResponse {
         ws_ticket,
@@ -439,7 +455,12 @@ async fn handle_agent_socket(mut socket: WebSocket, state: AppState, session: Ag
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) if text == "ping" => {
+                        let _ = refresh_mcp_liveness(&state, &session).await;
                         let _ = socket.send(Message::Text("pong".to_string())).await;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = refresh_mcp_liveness(&state, &session).await;
+                        let _ = socket.send(Message::Pong(payload)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -575,6 +596,75 @@ fn ensure_connect_allowed(agent: &McpAgentRecord) -> AppResult<()> {
         "REVOKED" => Err(AppError::AgentRevoked),
         _ => Ok(()),
     }
+}
+
+async fn resolve_mcp_slot_status(state: &AppState, agent: &McpAgentRecord) -> AppResult<String> {
+    match agent.status.as_str() {
+        "SUSPENDED" | "REVOKED" => Ok(agent.status.clone()),
+        _ => {
+            let rules = load_agent_rules(state, agent.treasury_id, agent.agent_id).await?;
+            if rules.is_empty() {
+                Ok("PENDING_CONFIGURATION".to_string())
+            } else {
+                Ok("ACTIVE".to_string())
+            }
+        }
+    }
+}
+
+async fn refresh_mcp_liveness(state: &AppState, session: &AgentSession) -> AppResult<()> {
+    let row = sqlx::query(
+        r#"SELECT agent_id, treasury_id, agent_pubkey, status, created_at
+           FROM agent_slots
+           WHERE agent_id = $1 AND treasury_id = $2
+           LIMIT 1"#,
+    )
+    .bind(session.agent_id)
+    .bind(session.treasury_id)
+    .fetch_optional(&state.db)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(());
+    };
+
+    let agent = McpAgentRecord {
+        agent_id: row.get("agent_id"),
+        treasury_id: row.get("treasury_id"),
+        public_key: row.get("agent_pubkey"),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+    };
+
+    if matches!(agent.status.as_str(), "SUSPENDED" | "REVOKED") {
+        return Ok(());
+    }
+
+    let next_status = resolve_mcp_slot_status(state, &agent).await?;
+    sqlx::query("UPDATE agent_slots SET status = $1, last_connected = $2 WHERE agent_id = $3")
+        .bind(&next_status)
+        .bind(Utc::now())
+        .bind(agent.agent_id)
+        .execute(&state.db)
+        .await?;
+
+    if next_status != agent.status {
+        let _ = state
+            .tx_events
+            .send(crate::TreasuryEvent::AgentStatusChanged {
+                treasury_id: agent.treasury_id,
+                agent_id: agent.agent_id,
+                new_status: next_status.clone(),
+            });
+        if next_status == "ACTIVE" {
+            let _ = state.tx_events.send(crate::TreasuryEvent::AgentActivated {
+                treasury_id: agent.treasury_id,
+                agent_id: agent.agent_id,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn issue_ws_ticket(state: &AppState, agent: &McpAgentRecord) -> AppResult<String> {
