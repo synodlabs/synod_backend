@@ -1,6 +1,7 @@
 use crate::common::setup_test_context;
 use http::Request;
 use reqwest::StatusCode;
+use synod_coordinator::TreasuryEvent;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
@@ -66,7 +67,33 @@ async fn test_phase_10_dashboard_and_ws() {
     assert_eq!(state_data["name"], "Dashboard Test Treasury");
     assert_eq!(state_data["current_aum_usd"], 50000.0);
 
-    // 5. Test WebSocket Connection
+    // 5. Persisted dashboard events should be queryable after refresh
+    synod_coordinator::persist_treasury_event(
+        &ctx.db,
+        &TreasuryEvent::AgentConnected {
+            treasury_id: treasury_uuid,
+            agent_id: Uuid::new_v4(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let events_resp = client
+        .get(format!(
+            "{}/v1/dashboard/{}/events?limit=10",
+            base_url, treasury_id
+        ))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(events_resp.status(), StatusCode::OK);
+    let events_data: Vec<serde_json::Value> = events_resp.json().await.unwrap();
+    assert!(!events_data.is_empty());
+    assert_eq!(events_data[0]["event_type"], "AGENT_CONNECTED");
+    assert!(events_data[0]["payload"]["timestamp"].is_string());
+
+    // 6. Test WebSocket Connection
     let ws_url = base_url.replace("http://", "ws://") + "/v1/dashboard/ws";
     let host = base_url.replace("http://", "");
 
@@ -88,5 +115,5 @@ async fn test_phase_10_dashboard_and_ws() {
         .await
         .expect("Failed to connect to WS");
 
-    // 6. WS handshake success is enough for this integration test.
+    // 7. WS handshake success is enough for this integration test.
 }

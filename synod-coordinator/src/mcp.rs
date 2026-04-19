@@ -92,6 +92,7 @@ pub struct SubmitIntentResponse {
     pub intent_id: Uuid,
     pub status: String,
     pub tx_hash: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +386,16 @@ pub async fn submit_intent(
     };
     store_intent_record(&state, &record).await?;
 
+    let _ = state.tx_events.send(crate::TreasuryEvent::IntentReceived {
+        treasury_id: agent.treasury_id,
+        agent_id: agent.agent_id,
+        intent_id,
+        intent_type: resolved_intent.kind.clone(),
+        wallet_address: resolved_intent.wallet_address.clone(),
+        asset_code: resolved_intent.asset_code.clone(),
+        amount: resolved_intent.amount.to_string(),
+    });
+
     if result.approved {
         let _ = state.tx_events.send(crate::TreasuryEvent::IntentConfirmed {
             treasury_id: agent.treasury_id,
@@ -397,7 +408,9 @@ pub async fn submit_intent(
             treasury_id: agent.treasury_id,
             agent_id: agent.agent_id,
             intent_id,
-            reason: reason.unwrap_or_else(|| "POLICY_REJECTED".to_string()),
+            reason: reason
+                .clone()
+                .unwrap_or_else(|| "POLICY_REJECTED".to_string()),
         });
     }
 
@@ -405,6 +418,7 @@ pub async fn submit_intent(
         intent_id,
         status,
         tx_hash: None,
+        reason,
     }))
 }
 
@@ -475,6 +489,24 @@ fn map_event_for_mcp(event: &crate::TreasuryEvent, session: &AgentSession) -> Op
                 "type": "intent_confirmed",
                 "intent_id": intent_id,
                 "tx_hash": tx_hash,
+            }))
+        }
+        crate::TreasuryEvent::IntentReceived {
+            treasury_id,
+            agent_id,
+            intent_id,
+            intent_type,
+            wallet_address,
+            asset_code,
+            amount,
+        } if *treasury_id == session.treasury_id && *agent_id == session.agent_id => {
+            Some(serde_json::json!({
+                "type": "intent_received",
+                "intent_id": intent_id,
+                "intent_type": intent_type,
+                "wallet_address": wallet_address,
+                "asset_code": asset_code,
+                "amount": amount,
             }))
         }
         crate::TreasuryEvent::IntentRejected {

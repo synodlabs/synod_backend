@@ -15,6 +15,7 @@ pub mod stellar;
 pub mod treasury;
 pub mod wallet;
 
+use chrono::Utc;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -90,6 +91,15 @@ pub enum TreasuryEvent {
         treasury_id: Uuid,
         agent_id: Uuid,
     },
+    IntentReceived {
+        treasury_id: Uuid,
+        agent_id: Uuid,
+        intent_id: Uuid,
+        intent_type: String,
+        wallet_address: String,
+        asset_code: String,
+        amount: String,
+    },
     IntentConfirmed {
         treasury_id: Uuid,
         agent_id: Uuid,
@@ -125,6 +135,7 @@ impl TreasuryEvent {
             | TreasuryEvent::AgentConnected { treasury_id, .. }
             | TreasuryEvent::AgentSignerAdded { treasury_id, .. }
             | TreasuryEvent::AgentActivated { treasury_id, .. }
+            | TreasuryEvent::IntentReceived { treasury_id, .. }
             | TreasuryEvent::IntentConfirmed { treasury_id, .. }
             | TreasuryEvent::IntentRejected { treasury_id, .. }
             | TreasuryEvent::IntentFailed { treasury_id, .. } => *treasury_id,
@@ -222,6 +233,26 @@ impl TreasuryEvent {
                 "AGENT_ACTIVATED",
                 serde_json::json!({ "treasury_id": treasury_id, "agent_id": agent_id }),
             ),
+            TreasuryEvent::IntentReceived {
+                treasury_id,
+                agent_id,
+                intent_id,
+                intent_type,
+                wallet_address,
+                asset_code,
+                amount,
+            } => (
+                "INTENT_RECEIVED",
+                serde_json::json!({
+                    "treasury_id": treasury_id,
+                    "agent_id": agent_id,
+                    "intent_id": intent_id,
+                    "intent_type": intent_type,
+                    "wallet_address": wallet_address,
+                    "asset_code": asset_code,
+                    "amount": amount,
+                }),
+            ),
             TreasuryEvent::IntentConfirmed {
                 treasury_id,
                 agent_id,
@@ -256,6 +287,42 @@ impl TreasuryEvent {
             payload,
         }
     }
+}
+
+pub async fn persist_treasury_event(db: &PgPool, event: &TreasuryEvent) -> Result<(), sqlx::Error> {
+    let treasury_id = event.treasury_id();
+    let envelope = event.to_envelope();
+    let lock_key = (treasury_id.as_u128() & 0x7FFF_FFFF_FFFF_FFFF) as i64;
+
+    let mut tx = db.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+
+    let next_sequence: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE treasury_id = $1",
+    )
+    .bind(treasury_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO events (event_id, treasury_id, event_type, sequence, payload, emitted_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(treasury_id)
+    .bind(envelope.event_type)
+    .bind(next_sequence)
+    .bind(envelope.payload)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Shared map of active Horizon watcher task handles, keyed by wallet address.

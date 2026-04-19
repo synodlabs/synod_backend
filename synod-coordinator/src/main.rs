@@ -128,6 +128,31 @@ async fn main() -> anyhow::Result<()> {
 
     let app = synod_coordinator::router(state.clone());
 
+    // Persist the live event bus so dashboard history survives refreshes and deploy restarts.
+    let db_pool_events = state.db.clone();
+    let mut rx_event_store = state.tx_events.subscribe();
+    tokio::spawn(async move {
+        info!("Treasury event persistence worker started");
+        loop {
+            match rx_event_store.recv().await {
+                Ok(event) => {
+                    if let Err(error) =
+                        synod_coordinator::persist_treasury_event(&db_pool_events, &event).await
+                    {
+                        tracing::error!("Failed to persist treasury event: {}", error);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        "Treasury event persistence lagged and skipped {} events",
+                        skipped
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
     // Spawn Background Permit TTL Watcher
     let db_pool_clone = state.db.clone();
     tokio::spawn(async move {

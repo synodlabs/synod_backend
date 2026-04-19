@@ -11,6 +11,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::HashSet;
@@ -66,6 +67,19 @@ pub struct DashboardBalances {
     pub treasury_id: Uuid,
     pub balances: Vec<WalletBalance>,
     pub total_aum_usd: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventHistoryQuery {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardEventRecord {
+    pub event_type: String,
+    pub sequence: i64,
+    pub emitted_at: DateTime<Utc>,
+    pub payload: serde_json::Value,
 }
 
 pub async fn list_treasuries(
@@ -207,6 +221,52 @@ pub async fn get_treasury_balances(
     }))
 }
 
+pub async fn get_treasury_events(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+    axum::extract::Query(query): axum::extract::Query<EventHistoryQuery>,
+) -> AppResult<Json<Vec<DashboardEventRecord>>> {
+    if !user_owns_treasury(&state, auth.user_id, id).await? {
+        return Err(AppError::TreasuryNotFound);
+    }
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let rows = sqlx::query(
+        "SELECT event_type, sequence, payload, emitted_at
+         FROM events
+         WHERE treasury_id = $1
+         ORDER BY sequence DESC
+         LIMIT $2",
+    )
+    .bind(id)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await?;
+
+    let records = rows
+        .into_iter()
+        .map(|row| {
+            let emitted_at: DateTime<Utc> = row.get("emitted_at");
+            let mut payload = row.get::<serde_json::Value, _>("payload");
+            if let Some(object) = payload.as_object_mut() {
+                object
+                    .entry("timestamp".to_string())
+                    .or_insert_with(|| serde_json::json!(emitted_at));
+            }
+
+            DashboardEventRecord {
+                event_type: row.get("event_type"),
+                sequence: row.get("sequence"),
+                emitted_at,
+                payload,
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -247,5 +307,6 @@ pub fn router() -> Router<AppState> {
         .route("/", get(list_treasuries))
         .route("/:id", get(get_treasury_state))
         .route("/:id/balances", get(get_treasury_balances))
+        .route("/:id/events", get(get_treasury_events))
         .route("/ws", get(ws_handler))
 }

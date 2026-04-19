@@ -23,27 +23,35 @@ pub struct MultisigStatusResponse {
     pub coordinator_pubkey: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfirmMultisigRequest {
+    pub wallet_address: String,
+}
+
 pub async fn get_multisig_setup(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(treasury_id): Path<Uuid>,
 ) -> AppResult<Json<MultisigSetupResponse>> {
     // 1. Verify ownership
-    let treasury = sqlx::query("SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2")
-        .bind(treasury_id)
-        .bind(auth.user_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound("Treasury not found".into()))?;
+    let treasury = sqlx::query(
+        "SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2",
+    )
+    .bind(treasury_id)
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound("Treasury not found".into()))?;
 
     // 2. Get the primary wallet for this treasury
-    let wallet = sqlx::query("SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 LIMIT 1")
-        .bind(treasury.get::<Uuid, _>("treasury_id"))
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound(
-            "No wallet connected to this treasury".into(),
-        ))?;
+    let wallet =
+        sqlx::query("SELECT wallet_address FROM treasury_wallets WHERE treasury_id = $1 LIMIT 1")
+            .bind(treasury.get::<Uuid, _>("treasury_id"))
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound(
+                "No wallet connected to this treasury".into(),
+            ))?;
 
     // 3. Construct SetOptions XDR
     // We add the coordinator as a signer with weight 20
@@ -73,24 +81,34 @@ pub async fn confirm_multisig(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(treasury_id): Path<Uuid>,
+    Json(payload): Json<ConfirmMultisigRequest>,
 ) -> AppResult<Json<MultisigStatusResponse>> {
     // 1. Verify ownership
-    let _ = sqlx::query("SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2")
-        .bind(treasury_id)
-        .bind(auth.user_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(AppError::NotFound("Treasury not found".into()))?;
-
-    // 2. Update status and mark multisig as active
-    sqlx::query(
-        "UPDATE treasury_wallets 
-         SET multisig_active = true, status = 'ACTIVE' 
-         WHERE treasury_id = $1 AND status IN ('PENDING', 'SYNCING')",
+    let _ = sqlx::query(
+        "SELECT treasury_id FROM treasuries WHERE treasury_id = $1 AND owner_user_id = $2",
     )
     .bind(treasury_id)
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound("Treasury not found".into()))?;
+
+    // 2. Update status and mark multisig as active
+    let result = sqlx::query(
+        "UPDATE treasury_wallets 
+         SET multisig_active = true, status = 'ACTIVE' 
+         WHERE treasury_id = $1 AND wallet_address = $2",
+    )
+    .bind(treasury_id)
+    .bind(&payload.wallet_address)
     .execute(&state.db)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(
+            "Wallet not found in this treasury".into(),
+        ));
+    }
 
     Ok(Json(MultisigStatusResponse {
         is_active: true,

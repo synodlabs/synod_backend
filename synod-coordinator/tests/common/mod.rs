@@ -81,6 +81,14 @@ pub async fn spawn_test_server() -> String {
             as WatcherHandles,
     };
 
+    let db_pool_events = state.db.clone();
+    let mut rx_event_store = state.tx_events.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = rx_event_store.recv().await {
+            let _ = synod_coordinator::persist_treasury_event(&db_pool_events, &event).await;
+        }
+    });
+
     let app = synod_coordinator::router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1152,6 +1152,7 @@ pub async fn revoke_agent(
     let revoked_by = existing_pubkey
         .clone()
         .unwrap_or_else(|| "synod".to_string());
+    let scrubbed_name = format!("Revoked Agent {}", &agent_id.to_string()[..8]);
 
     let mut tx = state.db.begin().await?;
 
@@ -1184,12 +1185,15 @@ pub async fn revoke_agent(
     sqlx::query(
         "UPDATE agent_slots
          SET status = 'REVOKED',
-             revoked_at = $1,
+             name = $1,
+             description = NULL,
+             revoked_at = $2,
              agent_pubkey = NULL,
              wallet_address = NULL,
              last_connected = NULL
-         WHERE agent_id = $2 AND treasury_id = $3",
+         WHERE agent_id = $3 AND treasury_id = $4",
     )
+    .bind(&scrubbed_name)
     .bind(now)
     .bind(agent_id)
     .bind(treasury_id)
