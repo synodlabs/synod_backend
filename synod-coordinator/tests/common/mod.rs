@@ -14,6 +14,9 @@ pub async fn spawn_test_server() -> String {
         .with_test_writer()
         .try_init();
 
+    let (coordinator_signing_key, coordinator_pubkey) = generate_test_stellar_keypair();
+    let coordinator_secret_key = encode_test_stellar_secret(&coordinator_signing_key);
+
     let settings = Settings {
         server: synod_coordinator::config::ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -29,9 +32,10 @@ pub async fn spawn_test_server() -> String {
         stellar: synod_coordinator::config::StellarConfig {
             network: "testnet".to_string(),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
-            horizon_url: "https://horizon-testnet.stellar.org".to_string(),
-            coordinator_pubkey: "GD...".to_string(),
-            coordinator_secret_key: "".to_string(),
+            horizon_url: std::env::var("SYNOD_TEST_HORIZON_URL")
+                .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+            coordinator_pubkey,
+            coordinator_secret_key,
             coordinator_secret_key_path: "".to_string(),
         },
         auth: synod_coordinator::config::AuthConfig {
@@ -116,6 +120,133 @@ pub fn generate_test_stellar_keypair() -> (ed25519_dalek::SigningKey, String) {
 
     let pk_stellar = data_encoding::BASE32_NOPAD.encode(&raw);
     (signing_key, pk_stellar)
+}
+
+#[allow(dead_code)]
+pub fn encode_test_stellar_secret(signing_key: &ed25519_dalek::SigningKey) -> String {
+    let mut raw = vec![0x90u8];
+    raw.extend_from_slice(&signing_key.to_bytes());
+    raw.extend_from_slice(&[0, 0]);
+
+    data_encoding::BASE32_NOPAD.encode(&raw)
+}
+
+#[allow(dead_code)]
+pub fn build_test_payment_envelope_xdr(
+    source_address: &str,
+    destination_address: &str,
+    amount_stroops: i64,
+) -> String {
+    use synod_coordinator::stellar::next_xdr::{
+        Asset, DecoratedSignature, Limits, Memo, MuxedAccount, Operation, OperationBody, PaymentOp,
+        Preconditions, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionV1Envelope, Uint256, WriteXdr,
+    };
+
+    let source = MuxedAccount::Ed25519(Uint256(
+        synod_coordinator::stellar::decode_stellar_address(source_address).unwrap(),
+    ));
+    let destination = MuxedAccount::Ed25519(Uint256(
+        synod_coordinator::stellar::decode_stellar_address(destination_address).unwrap(),
+    ));
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::Payment(PaymentOp {
+            destination,
+            asset: Asset::Native,
+            amount: amount_stroops,
+        }),
+    };
+
+    let transaction = Transaction {
+        source_account: source,
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: transaction,
+        signatures: Vec::<DecoratedSignature>::new().try_into().unwrap(),
+    });
+
+    let raw = envelope.to_xdr(Limits::none()).unwrap();
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw)
+}
+
+#[allow(dead_code)]
+pub fn build_signed_test_payment_envelope_xdr(
+    source_address: &str,
+    destination_address: &str,
+    amount_stroops: i64,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> String {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::Signer;
+    use synod_coordinator::stellar::next_xdr::{
+        DecoratedSignature, Limits, ReadXdr, Signature, SignatureHint, TransactionEnvelope, WriteXdr,
+    };
+
+    let xdr = build_test_payment_envelope_xdr(source_address, destination_address, amount_stroops);
+    let raw_env = BASE64.decode(&xdr).unwrap();
+    let mut envelope = TransactionEnvelope::from_xdr(&raw_env, Limits::none()).unwrap();
+    let candidate_hashes = synod_coordinator::stellar::calculate_tx_v1_hashes(
+        &raw_env,
+        "Test SDF Network ; September 2015",
+    )
+    .unwrap();
+    let hash = candidate_hashes[0];
+    let signature_bytes = signing_key.sign(&hash).to_bytes();
+
+    let TransactionEnvelope::Tx(v1_env) = &mut envelope else {
+        panic!("expected v1 envelope");
+    };
+
+    let pubkey_bytes = signing_key.verifying_key().to_bytes();
+    let hint = [
+        pubkey_bytes[28],
+        pubkey_bytes[29],
+        pubkey_bytes[30],
+        pubkey_bytes[31],
+    ];
+
+    let mut signatures: Vec<DecoratedSignature> = v1_env.signatures.clone().into();
+    signatures.push(DecoratedSignature {
+        hint: SignatureHint(hint),
+        signature: Signature(signature_bytes.to_vec().try_into().unwrap()),
+    });
+    v1_env.signatures = signatures.try_into().unwrap();
+
+    let final_xdr = envelope.to_xdr(Limits::none()).unwrap();
+    BASE64.encode(final_xdr)
+}
+
+#[allow(dead_code)]
+pub async fn spawn_mock_horizon_server(tx_hash: &str) -> String {
+    use axum::{routing::post, Json, Router};
+    use tokio::net::TcpListener;
+
+    async fn submit_transaction(
+        axum::extract::State(hash): axum::extract::State<String>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({ "hash": hash }))
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/transactions", post(submit_transaction))
+        .with_state(tx_hash.to_string());
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("http://{}", addr)
 }
 
 #[allow(dead_code)]

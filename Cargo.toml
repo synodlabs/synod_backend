@@ -21,3 +21,9 @@ anyhow = "1.0"
 thiserror = "1.0"
 dotenvy = "0.15"
 bigdecimal = { version = "0.4", features = ["serde"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

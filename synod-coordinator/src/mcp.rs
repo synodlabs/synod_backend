@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 use std::str::FromStr;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -85,6 +86,7 @@ pub struct SubmitIntentRequest {
     pub public_key: String,
     pub signature: String,
     pub intent: Value,
+    pub signed_transaction_xdr: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,7 +140,10 @@ struct ResolvedIntent {
     kind: String,
     amount: BigDecimal,
     asset_code: String,
+    asset_issuer: Option<String>,
     wallet_address: String,
+    destination: String,
+    memo: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -357,14 +362,14 @@ pub async fn submit_intent(
         treasury_id: agent.treasury_id,
         wallet_address: resolved_intent.wallet_address.clone(),
         asset_code: resolved_intent.asset_code.clone(),
-        asset_issuer: None,
+        asset_issuer: resolved_intent.asset_issuer.clone(),
         requested_amount: resolved_intent.amount.clone(),
     };
 
     let (result, permit_id) =
         process_single_permit(&mut tx, &state, &permit_request, group_id, Uuid::new_v4()).await?;
     let status = if result.approved {
-        "confirmed"
+        "executing"
     } else {
         "rejected"
     }
@@ -378,29 +383,13 @@ pub async fn submit_intent(
     sqlx::query(
         "UPDATE permit_groups SET status = $1, total_approved_usd = $2 WHERE group_id = $3",
     )
-    .bind(if result.approved { "ACTIVE" } else { "DENIED" })
+    .bind(if result.approved { "EXECUTING" } else { "DENIED" })
     .bind(approved_total)
     .bind(group_id)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-
-    let reason = result.deny_reason.clone();
-    let record = IntentRecord {
-        intent_id,
-        agent_id: agent.agent_id,
-        treasury_id: agent.treasury_id,
-        public_key: agent.public_key.clone(),
-        intent_type: resolved_intent.kind.clone(),
-        status: status.clone(),
-        reason: reason.clone(),
-        tx_hash: None,
-        permit_id: Some(permit_id),
-        created_at,
-        updated_at: Utc::now().timestamp_millis(),
-    };
-    store_intent_record(&state, &record).await?;
 
     let _ = state.tx_events.send(crate::TreasuryEvent::IntentReceived {
         treasury_id: agent.treasury_id,
@@ -412,14 +401,23 @@ pub async fn submit_intent(
         amount: resolved_intent.amount.to_string(),
     });
 
-    if result.approved {
-        let _ = state.tx_events.send(crate::TreasuryEvent::IntentConfirmed {
-            treasury_id: agent.treasury_id,
-            agent_id: agent.agent_id,
+    let reason = result.deny_reason.clone();
+    if !result.approved {
+        let record = IntentRecord {
             intent_id,
+            agent_id: agent.agent_id,
+            treasury_id: agent.treasury_id,
+            public_key: agent.public_key.clone(),
+            intent_type: resolved_intent.kind.clone(),
+            status,
+            reason: reason.clone(),
             tx_hash: None,
-        });
-    } else {
+            permit_id: Some(permit_id),
+            created_at,
+            updated_at: Utc::now().timestamp_millis(),
+        };
+        store_intent_record(&state, &record).await?;
+
         let _ = state.tx_events.send(crate::TreasuryEvent::IntentRejected {
             treasury_id: agent.treasury_id,
             agent_id: agent.agent_id,
@@ -428,14 +426,87 @@ pub async fn submit_intent(
                 .clone()
                 .unwrap_or_else(|| "POLICY_REJECTED".to_string()),
         });
+        return Ok(Json(SubmitIntentResponse {
+            intent_id,
+            status: "rejected".to_string(),
+            tx_hash: None,
+            reason,
+        }));
     }
 
-    Ok(Json(SubmitIntentResponse {
+    match execute_signed_intent(
+        &state,
+        &agent,
         intent_id,
-        status,
-        tx_hash: None,
-        reason,
-    }))
+        permit_id,
+        &resolved_intent,
+        &payload.signed_transaction_xdr,
+    )
+    .await
+    {
+        Ok(tx_hash) => {
+            let record = IntentRecord {
+                intent_id,
+                agent_id: agent.agent_id,
+                treasury_id: agent.treasury_id,
+                public_key: agent.public_key.clone(),
+                intent_type: resolved_intent.kind.clone(),
+                status: "executed".to_string(),
+                reason: None,
+                tx_hash: Some(tx_hash.clone()),
+                permit_id: Some(permit_id),
+                created_at,
+                updated_at: Utc::now().timestamp_millis(),
+            };
+            store_intent_record(&state, &record).await?;
+
+            let _ = state.tx_events.send(crate::TreasuryEvent::PermitConsumed {
+                treasury_id: agent.treasury_id,
+                permit_id,
+                wallet_address: resolved_intent.wallet_address.clone(),
+            });
+            let _ = state.tx_events.send(crate::TreasuryEvent::IntentConfirmed {
+                treasury_id: agent.treasury_id,
+                agent_id: agent.agent_id,
+                intent_id,
+                tx_hash: Some(tx_hash.clone()),
+            });
+
+            Ok(Json(SubmitIntentResponse {
+                intent_id,
+                status: "executed".to_string(),
+                tx_hash: Some(tx_hash),
+                reason: None,
+            }))
+        }
+        Err(error) => {
+            let reason_text = error.to_string();
+            mark_intent_execution_failed(&state, permit_id, &reason_text).await?;
+
+            let record = IntentRecord {
+                intent_id,
+                agent_id: agent.agent_id,
+                treasury_id: agent.treasury_id,
+                public_key: agent.public_key.clone(),
+                intent_type: resolved_intent.kind.clone(),
+                status: "failed".to_string(),
+                reason: Some(reason_text.clone()),
+                tx_hash: None,
+                permit_id: Some(permit_id),
+                created_at,
+                updated_at: Utc::now().timestamp_millis(),
+            };
+            store_intent_record(&state, &record).await?;
+
+            let _ = state.tx_events.send(crate::TreasuryEvent::IntentFailed {
+                treasury_id: agent.treasury_id,
+                agent_id: agent.agent_id,
+                intent_id,
+                reason: reason_text.clone(),
+            });
+            Err(error)
+        }
+    }
 }
 
 pub async fn agent_ws(
@@ -811,7 +882,13 @@ fn parse_and_resolve_intent(
         kind,
         amount,
         asset_code,
+        asset_issuer: None,
         wallet_address,
+        destination: destination.unwrap().to_string(),
+        memo: intent
+            .get("memo")
+            .and_then(Value::as_str)
+            .map(|memo| memo.to_string()),
     })
 }
 
@@ -927,6 +1004,284 @@ fn serialize_canonical_value(value: &Value) -> String {
             format!("{{{}}}", items)
         }
     }
+}
+
+async fn execute_signed_intent(
+    state: &AppState,
+    agent: &McpAgentRecord,
+    intent_id: Uuid,
+    permit_id: Uuid,
+    resolved_intent: &ResolvedIntent,
+    signed_transaction_xdr: &str,
+) -> AppResult<String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use stellar_xdr::curr::{
+        DecoratedSignature, Limits, Memo, OperationBody, ReadXdr, SignatureHint,
+        TransactionEnvelope, WriteXdr,
+    };
+
+    let raw_env = BASE64
+        .decode(signed_transaction_xdr)
+        .map_err(|_| AppError::CosignFailed("Invalid XDR base64 encoding".into()))?;
+
+    let mut envelope = TransactionEnvelope::from_xdr(&raw_env, Limits::none())
+        .map_err(|e| AppError::CosignFailed(format!("XDR decode failed: {}", e)))?;
+
+    let TransactionEnvelope::Tx(v1_env) = &mut envelope else {
+        return Err(AppError::CosignFailed(
+            "Only V1 transaction envelopes are supported".into(),
+        ));
+    };
+
+    let source = muxed_account_to_address(&v1_env.tx.source_account)?;
+    if source != resolved_intent.wallet_address {
+        return Err(AppError::CosignFailed(format!(
+            "Transaction source {} does not match permitted wallet {}",
+            source, resolved_intent.wallet_address
+        )));
+    }
+
+    if v1_env.tx.operations.len() != 1 {
+        return Err(AppError::CosignFailed(
+            "Transactions must contain exactly one payment operation".into(),
+        ));
+    }
+
+    let op = &v1_env.tx.operations[0];
+    let OperationBody::Payment(payment) = &op.body else {
+        return Err(AppError::CosignFailed(
+            "First operation must be a Payment".into(),
+        ));
+    };
+
+    let destination = muxed_account_to_address(&payment.destination)?;
+    if destination != resolved_intent.destination {
+        return Err(AppError::CosignFailed(format!(
+            "Destination mismatch: tx={} intent={}",
+            destination, resolved_intent.destination
+        )));
+    }
+
+    let (tx_asset_code, tx_asset_issuer) = asset_to_code_and_issuer(&payment.asset)?;
+    if tx_asset_code != resolved_intent.asset_code
+        || tx_asset_issuer != resolved_intent.asset_issuer
+    {
+        return Err(AppError::CosignFailed(format!(
+            "Asset mismatch: tx={} intent={}",
+            tx_asset_code, resolved_intent.asset_code
+        )));
+    }
+
+    let tx_amount = BigDecimal::from(payment.amount) / BigDecimal::from(10_000_000i64);
+    if tx_amount != resolved_intent.amount {
+        return Err(AppError::CosignFailed(format!(
+            "Amount mismatch: tx={} intent={}",
+            tx_amount, resolved_intent.amount
+        )));
+    }
+
+    if let Some(expected_memo) = &resolved_intent.memo {
+        match &v1_env.tx.memo {
+            Memo::Text(text) => {
+                let actual = text.to_string();
+                if &actual != expected_memo {
+                    return Err(AppError::CosignFailed(format!(
+                        "Memo mismatch: tx={} intent={}",
+                        actual, expected_memo
+                    )));
+                }
+            }
+            _ => {
+                return Err(AppError::CosignFailed(
+                    "Transaction memo does not match the signed intent".into(),
+                ));
+            }
+        }
+    }
+
+    let candidate_hashes =
+        stellar::calculate_tx_v1_hashes(&raw_env, &state.config.stellar.network_passphrase)?;
+    let verifying_key = VerifyingKey::from_bytes(&stellar::decode_stellar_address(&agent.public_key)?)
+        .map_err(|e| AppError::CosignFailed(format!("Invalid agent public key: {}", e)))?;
+
+    let mut matching_hash = None;
+    'outer: for candidate_hash in &candidate_hashes {
+        for sig in v1_env.signatures.iter() {
+            let signature = Signature::from_slice(&sig.signature.0)
+                .map_err(|_| AppError::CosignFailed("Invalid transaction signature".into()))?;
+            if verifying_key.verify(candidate_hash, &signature).is_ok() {
+                matching_hash = Some(*candidate_hash);
+                break 'outer;
+            }
+        }
+    }
+
+    let tx_hash_to_sign = matching_hash.ok_or_else(|| {
+        AppError::CosignFailed("Signed transaction is missing a valid agent signature".into())
+    })?;
+
+    let secret_bytes = stellar::decode_secret_key(&state.config.stellar.coordinator_secret_key)?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
+    let signature_bytes = <ed25519_dalek::SigningKey as ed25519_dalek::Signer<
+        ed25519_dalek::Signature,
+    >>::sign(&signing_key, &tx_hash_to_sign)
+    .to_bytes();
+
+    let coordinator_pubkey_bytes = signing_key.verifying_key().to_bytes();
+    let hint = [
+        coordinator_pubkey_bytes[28],
+        coordinator_pubkey_bytes[29],
+        coordinator_pubkey_bytes[30],
+        coordinator_pubkey_bytes[31],
+    ];
+
+    let mut signatures: Vec<DecoratedSignature> = v1_env.signatures.clone().into();
+    signatures.push(DecoratedSignature {
+        hint: SignatureHint(hint),
+        signature: stellar::next_xdr::Signature(
+            signature_bytes
+                .to_vec()
+                .try_into()
+                .map_err(|_| AppError::CosignFailed("Invalid coordinator signature length".into()))?,
+        ),
+    });
+    v1_env.signatures = signatures
+        .try_into()
+        .map_err(|_| AppError::CosignFailed("Too many signatures on transaction".into()))?;
+
+    let final_xdr = envelope
+        .to_xdr(Limits::none())
+        .map_err(|e| AppError::CosignFailed(format!("Final XDR encoding error: {}", e)))?;
+    let final_xdr_base64 = BASE64.encode(&final_xdr);
+
+    info!(
+        intent_id = %intent_id,
+        permit_id = %permit_id,
+        wallet_address = %resolved_intent.wallet_address,
+        destination = %resolved_intent.destination,
+        amount = %resolved_intent.amount,
+        asset = %resolved_intent.asset_code,
+        "Submitting co-signed intent transaction to Horizon"
+    );
+
+    let horizon_res = reqwest::Client::new()
+        .post(format!("{}/transactions", state.config.stellar.horizon_url))
+        .form(&[("tx", final_xdr_base64)])
+        .send()
+        .await
+        .map_err(|e| AppError::CosignFailed(format!("Horizon connection failed: {}", e)))?;
+
+    if !horizon_res.status().is_success() {
+        let err_body = horizon_res.text().await.unwrap_or_default();
+        error!(
+            intent_id = %intent_id,
+            permit_id = %permit_id,
+            error = %err_body,
+            "Horizon rejected the co-signed intent transaction"
+        );
+        return Err(AppError::CosignFailed(format!(
+            "Horizon rejected transaction: {}",
+            err_body
+        )));
+    }
+
+    let horizon_body: Value = horizon_res
+        .json()
+        .await
+        .map_err(|e| AppError::CosignFailed(format!("Invalid Horizon response: {}", e)))?;
+    let tx_hash = horizon_body
+        .get("hash")
+        .and_then(Value::as_str)
+        .map(|hash| hash.to_string())
+        .unwrap_or_else(|| hex::encode(stellar::sha256_bytes(&final_xdr)));
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE permits SET status = 'CONSUMED', tx_hash = $1, pnl_usd = 0, consumed_at = NOW() WHERE permit_id = $2",
+    )
+    .bind(&tx_hash)
+    .bind(permit_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE permit_groups SET status = 'CONSUMED', consumed_at = NOW() WHERE group_id = (SELECT group_id FROM permits WHERE permit_id = $1)",
+    )
+    .bind(permit_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(tx_hash)
+}
+
+async fn mark_intent_execution_failed(
+    state: &AppState,
+    permit_id: Uuid,
+    reason: &str,
+) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "UPDATE permits SET status = 'FAILED', deny_reason = $1 WHERE permit_id = $2 AND status = 'ACTIVE'",
+    )
+    .bind(reason)
+    .bind(permit_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE permit_groups SET status = 'FAILED' WHERE group_id = (SELECT group_id FROM permits WHERE permit_id = $1)",
+    )
+    .bind(permit_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    warn!(permit_id = %permit_id, reason = %reason, "Intent execution marked as failed");
+    Ok(())
+}
+
+fn muxed_account_to_address(account: &stellar::next_xdr::MuxedAccount) -> AppResult<String> {
+    match account {
+        stellar::next_xdr::MuxedAccount::Ed25519(key) => encode_stellar_address(&key.0),
+        stellar::next_xdr::MuxedAccount::MuxedEd25519(muxed) => {
+            encode_stellar_address(&muxed.ed25519.0)
+        }
+    }
+}
+
+fn asset_to_code_and_issuer(
+    asset: &stellar::next_xdr::Asset,
+) -> AppResult<(String, Option<String>)> {
+    match asset {
+        stellar::next_xdr::Asset::Native => Ok(("XLM".to_string(), None)),
+        stellar::next_xdr::Asset::CreditAlphanum4(asset) => Ok((
+            String::from_utf8_lossy(&asset.asset_code.0)
+                .trim_end_matches('\0')
+                .to_string(),
+            Some(account_id_to_address(&asset.issuer)?),
+        )),
+        stellar::next_xdr::Asset::CreditAlphanum12(asset) => Ok((
+            String::from_utf8_lossy(&asset.asset_code.0)
+                .trim_end_matches('\0')
+                .to_string(),
+            Some(account_id_to_address(&asset.issuer)?),
+        )),
+    }
+}
+
+fn account_id_to_address(account_id: &stellar::next_xdr::AccountId) -> AppResult<String> {
+    match account_id {
+        stellar::next_xdr::AccountId(stellar::next_xdr::PublicKey::PublicKeyTypeEd25519(key)) => {
+            encode_stellar_address(&key.0)
+        }
+    }
+}
+
+fn encode_stellar_address(key_bytes: &[u8; 32]) -> AppResult<String> {
+    let mut raw = Vec::with_capacity(35);
+    raw.push(0x30u8);
+    raw.extend_from_slice(key_bytes);
+    raw.extend_from_slice(&[0, 0]);
+    Ok(data_encoding::BASE32_NOPAD.encode(&raw))
 }
 
 #[cfg(test)]
