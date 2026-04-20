@@ -6,8 +6,9 @@ use uuid::Uuid;
 
 mod common;
 use common::{
-    attach_active_wallet, build_signed_request_auth, connect_agent, create_agent_slot,
-    create_treasury, enroll_agent_pubkey, generate_test_stellar_keypair, setup_test_context,
+    attach_active_wallet, build_signed_request_auth, build_test_payment_envelope_xdr,
+    connect_agent, create_agent_slot, create_treasury, enroll_agent_pubkey,
+    generate_test_stellar_keypair, setup_test_context,
 };
 
 #[derive(Serialize)]
@@ -138,7 +139,12 @@ async fn test_permit_full_lifecycle_with_signed_requests() {
     let permit_id = Uuid::parse_str(permit_body["permit_id"].as_str().unwrap()).unwrap();
     assert_eq!(permit_body["approved"].as_bool().unwrap(), true);
 
-    let xdr = "VALID_STELLAR_XDR_DATA";
+    let (_destination_signing_key, destination_address) = generate_test_stellar_keypair();
+    let xdr = build_test_payment_envelope_xdr(
+        &wallet_address,
+        &destination_address,
+        500 * 10_000_000,
+    );
     let cosign_response = ctx.client
         .post(format!("{}/v1/permits/{}/cosign", ctx.base_url, permit_id))
         .header("Authorization", format!("Bearer {}", session_token))

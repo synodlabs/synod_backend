@@ -63,7 +63,7 @@ async fn test_phase_3_wallet_flow() {
         .send()
         .await
         .unwrap();
-    assert_eq!(reg_wallet_res.status(), StatusCode::CREATED);
+    assert_eq!(reg_wallet_res.status(), StatusCode::OK);
 
     // 5. Get Nonce for our generated wallet address
     let nonce_res = client

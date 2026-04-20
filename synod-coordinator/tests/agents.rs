@@ -285,10 +285,10 @@ async fn test_revoking_agent_releases_pubkey_and_cleans_access_state() {
 
     sqlx::query(
         "INSERT INTO permits (
-            permit_id, group_id, leg_id, agent_id, treasury_id, wallet_address, pool_key, asset_code,
+            permit_id, group_id, leg_id, agent_id, treasury_id, wallet_address, asset_code,
             requested_amount, approved_amount, status, state_snapshot_hash, coordinator_sig, expires_at
          ) VALUES (
-            $1, $2, $3, $4, $5, $6, 'XLM', 'XLM',
+            $1, $2, $3, $4, $5, $6, 'XLM',
             1000.0, 1000.0, 'ACTIVE', 'snapshot', 'signature', NOW() + INTERVAL '1 hour'
          )",
     )
